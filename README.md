@@ -32,8 +32,8 @@ SLURM array job scripts for running fMRIPrep and XCP-D used on the University of
 
 | File | Description |
 |---|---|
-| `fmriprep_apptainer_one_single.sl` | fMRIPrep preprocessing, subjects 0-999 |
-| `fmriprep_apptainer_one_single_2.sl` | fMRIPrep preprocessing, subjects 1000-1217 |
+| `fmriprep_apptainer_one_single.sl` | fMRIPrep preprocessing, subject-timepoints 0-999 |
+| `fmriprep_apptainer_one_single_2.sl` | fMRIPrep preprocessing, subject-timepoints 1000-1217 |
 | `xcp_d_alff_acompcor_censorMT_12_5_2025.sl` | XCP-D post-processing with motion censoring (threshold), part 1 |
 | `xcp_d_alff_acompor_censorMT_12_5_2025_p2.sl` | XCP-D post-processing with motion censoring, part 2 |
 | `xcp_d_alff_acompcor_nocensor_REDO_9_5_2025.sl` | XCP-D post-processing without censoring (for ALFF), part 1 |
