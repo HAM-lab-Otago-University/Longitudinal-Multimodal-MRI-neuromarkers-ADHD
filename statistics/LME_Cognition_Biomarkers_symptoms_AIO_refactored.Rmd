@@ -1,0 +1,676 @@
+---
+title: "LME_Oregon_Cog_and_symptoms_AIO"
+author: "Jack Scott"
+date: "2026-01-23"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Setup
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir ='/media/hcs-sci-psy-narun/Jack/First_level_model_aligned/Stacked_model_ridge_v4_EXTREME_conserve_a2000_keeper')
+``` 
+
+# Packages
+```{r packages}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(sjPlot)
+library(r2mlm)
+library(glmm.hp)
+library(broom.mixed)
+```
+
+# Data Preparation
+```{r data_prep}
+# Load Neuroimaging/Cognition Data
+cognition_data <- readr::read_csv("/media/hcs-sci-psy-narun/Jack/First_level_model_aligned/Stacked_model_ridge_v4_EXTREME_conserve_a2000_keeper/stacked_ridge_predictions.csv")
+
+# Load Phenotype Data (ADHD Diagnosis)
+phenotype_data <- read_csv("/media/hcs-sci-psy-narun/Jack/HMM_ELM_data_prep/phase4_statistical_analysis/analysis_ready_dataset.csv")
+
+# Load Inattention/Hyperactivity Matched Datasets
+inattention_scores <- readr::read_csv("/media/hcs-sci-psy-narun/Jack/LME_cog_inattention/inattention_scores_matched.csv")
+hyperactivity_scores <- readr::read_csv("/media/hcs-sci-psy-narun/Jack/LME_cog_hyperactivity/hyperactivity_scores_matched.csv")
+
+# Pre-processing & Merging
+analysis_data <- cognition_data %>%
+  # Extract metadata
+  mutate(participant_id = str_extract(subject_id, "^[^_]+"),
+         Age = as.numeric(str_extract(subject_id, "(?<=_Age)\\d+"))) %>%
+  # Merge Phenotypes
+  left_join(
+    phenotype_data %>% 
+      mutate(subject_id_match = paste0(subject_id, "_Age", age_months)) %>%
+      select(subject_id_match, final_phenotype, sex),
+    by = c("subject_id" = "subject_id_match")
+  ) %>%
+  # Clean Diagnosis Label
+  mutate(ADHDdiagnosis = factor(case_when(
+    final_phenotype == 3 ~ "ADHD",
+    final_phenotype == 1 ~ "Control",
+    TRUE ~ NA_character_
+  ), levels = c("Control", "ADHD"))) %>%
+  # Merge Symptoms
+  mutate(
+    InattentionRaw = inattention_scores$inattention[match(subject_id, inattention_scores$subject_id)],
+    HyperactivityRaw = hyperactivity_scores$hyperactivity[match(subject_id, hyperactivity_scores$subject_id)]
+  ) %>%
+  # Standardizing
+  mutate(
+    participant_id = as_factor(participant_id),
+    Age0 = Age - min(Age, na.rm = TRUE),
+    true_g_z = as.double(scale(true_g)),
+    stacked_pred_z = as.double(scale(stacked_pred)),
+    inattention_z = as.double(scale(InattentionRaw)),
+    hyperactivity_z = as.double(scale(HyperactivityRaw))
+  ) %>%
+  # Within/Between Decomposition
+  group_by(participant_id) %>%
+    mutate(
+      true_g_z_mean = mean(true_g_z, na.rm = TRUE),
+      stacked_pred_z_mean = mean(stacked_pred_z, na.rm = TRUE),
+      InattentionMean = mean(inattention_z, na.rm = TRUE),
+      HyperactivityMean = mean(hyperactivity_z, na.rm = TRUE),
+      age_mean = mean(Age0, na.rm = TRUE),
+      count_timepoints = n()
+    ) %>%
+  ungroup() %>%
+  mutate(
+    true_g_z_dev = true_g_z - true_g_z_mean,
+    stacked_pred_z_dev = stacked_pred_z - stacked_pred_z_mean,
+    InattentionDeviation = inattention_z - InattentionMean,
+    HyperactivityDeviation = hyperactivity_z - HyperactivityMean,
+    age_deviation = Age0 - age_mean
+  ) %>%
+  # Filter for longitudinal analysis compatibility
+  filter(count_timepoints >= 2)
+
+cat("Final analysis dataset size:", nrow(analysis_data), "observations from", n_distinct(analysis_data$participant_id), "participants.\n")
+```
+
+```{r}
+# Calculate Pearson correlation between deviation scores
+pearson_correlation_deviations <- cor(analysis_data$true_g_z_dev, 
+                          analysis_data$stacked_pred_z_dev, 
+                          method = "pearson",
+                          use = "complete.obs")
+
+# Get unique participant-level data (since means are repeated for each observation)
+participant_means <- analysis_data[!duplicated(analysis_data$participant_id), ]
+
+# Create a scatterplot to visualize the relationship
+library(ggplot2)
+ggplot(analysis_data, aes(x = true_g_z_dev, y = stacked_pred_z_dev)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(x = "True g (deviation scores)", 
+       y = "Predicted g (deviation scores)",
+       title = "Within-Person Relationship: Observed vs Predicted g",
+       subtitle = paste("Pearson r =", round(pearson_correlation_deviations, 3))) +
+  theme_minimal()
+
+# Calculate Pearson correlation between participant means
+pearson_means <- cor(participant_means$true_g_z_mean, 
+                    participant_means$stacked_pred_z_mean, 
+                    method = "pearson",
+                    use = "complete.obs")
+
+# Create a scatterplot for participant means
+ggplot(participant_means, aes(x = true_g_z_mean, y = stacked_pred_z_mean)) +
+  geom_point(alpha = 0.7, size = 2, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", fill = "red", alpha = 0.2) +  
+  # Add correlation statistics in a properly sized box (lower right)
+  annotate("label", 
+           x = max(participant_means$true_g_z_mean, na.rm = TRUE) * 0.95, 
+           y = min(participant_means$stacked_pred_z_mean, na.rm = TRUE) * 0.95,
+           label = paste("Pearson r =", round(pearson_means, 3), 
+                         "\nn =", nrow(participant_means)),
+           size = 3,
+           fill = "white", 
+           color = "black",
+           alpha = 0.9,
+           label.size = 0.15) +  
+  labs(x = "Observed g (participant means)", 
+       y = "Predicted g (participant means)",
+       title = "Between-Person Relationship: Observed vs Predicted g") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        # Note: Changed size to linewidth to avoid ggplot2 deprecation warnings
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5))
+``` 
+
+
+# Model 1: ADHD Additive
+```{r m1_adhd_additive}
+m1_adhd_add <- lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + ADHDdiagnosis + (1 | participant_id), 
+                    data = analysis_data, REML = FALSE)
+summary(m1_adhd_add)
+```
+
+# Model 2: ADHD Interactive
+```{r m2_adhd_interactive}
+m2_adhd_int <- lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + ADHDdiagnosis + 
+                    stacked_pred_z_dev:ADHDdiagnosis + stacked_pred_z_mean:ADHDdiagnosis + (1 | participant_id), 
+                    data = analysis_data, REML = FALSE)
+summary(m2_adhd_int)
+```
+
+# Model 3: Neuroimaging-only
+```{r m3_neuroimaging}
+m3_neuro <- lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + (1 | participant_id), 
+                 data = analysis_data, REML = FALSE)
+summary(m3_neuro)
+```
+
+# Model 4: Age-only
+```{r m4_age}
+m4_age <- lmer(true_g_z ~ age_deviation + age_mean + (1 | participant_id), 
+               data = analysis_data, REML = FALSE)
+summary(m4_age)
+```
+
+# Model 5: Neuroimaging-and-age
+```{r m5_neuro_age}
+m5_neuro_age <- lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + age_deviation + age_mean + (1 | participant_id), 
+                     data = analysis_data, REML = FALSE)
+summary(m5_neuro_age)
+
+print("\n ===DEBUG===")
+# Diagnostic: Print full r2mlm structure
+# r2_full <- r2mlm::r2mlm(m5_neuro_age)
+# print("Full r2mlm output:")
+# print(r2_full)
+# print("\nNames in r2mlm object:")
+# print(names(r2_full))
+# print("\nStructure:")
+# str(r2_full)
+
+```
+
+# Model 6: Hyperactivity
+```{r m6_hyperactivity}
+m6_hyper <- lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + HyperactivityDeviation + HyperactivityMean + (1 | participant_id), 
+                 data = analysis_data, REML = FALSE)
+summary(m6_hyper)
+```
+# hyperactivity only
+```{r m6p5_hyperactivity_only}
+m6p5_hyper <- lmer(true_g_z ~ HyperactivityDeviation + HyperactivityMean + (1 | participant_id), 
+                 data = analysis_data, REML = FALSE)
+summary(m6p5_hyper)
+```
+
+
+# Model 7: Inattention
+```{r m7_inattention}
+m7_inatt <- lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + InattentionDeviation + InattentionMean + (1 | participant_id), 
+                 data = analysis_data, REML = FALSE)
+summary(m7_inatt)
+```
+
+```{r m7p5_inattention}
+m7p5_inatt <- lmer(true_g_z ~ InattentionDeviation + InattentionMean + (1 | participant_id), 
+                 data = analysis_data, REML = FALSE)
+summary(m7p5_inatt)
+```
+
+# ADHD Model Comparison
+```{r adhd_comparison}
+# Formal comparison
+comp_adhd <- anova(m1_adhd_add, m2_adhd_int)
+print(comp_adhd)
+
+# BIC Difference logic
+delta_bic <- BIC(m2_adhd_int) - BIC(m1_adhd_add)
+cat("\nDelta BIC (Interactive - Additive):", round(delta_bic, 2), "\n")
+if(delta_bic > 0) {
+  cat("Evidence favors the simpler ADDITIVE model.\n")
+} else {
+  cat("Evidence favors the INTERACTIVE model.\n")
+}
+```
+
+# Core Models Comparison
+```{r core_comparison}
+comp_biomarkers_age <- anova(m3_neuro, m4_age, m5_neuro_age)
+print(comp_biomarkers_age)
+```
+
+# SJPlot Tables: Core Models
+```{r sjplot_core}
+tab_model(m3_neuro, m4_age, m5_neuro_age, 
+          dv.labels = c("Neuroimaging Only", "Age Only", "Neuroimaging-and-Age"),
+          pred.labels = c(
+            "(Intercept)" = "Intercept",
+            "stacked_pred_z_dev" = "ĝ<sub>deviation</sub>",
+            "stacked_pred_z_mean" = "ĝ<sub>mean</sub>",
+            "age_deviation" = "age<sub>deviation</sub>",
+            "age_mean" = "age<sub>mean</sub>"
+          ),
+          show.aic = TRUE,
+          show.dev = TRUE,  # Shows deviance instead of BIC
+          title = "Model Comparison: Neuroimaging and Age",
+          file = "core_models")
+```
+
+# SJPlot Tables: ADHD Models
+```{r sjplot_adhd}
+tab_model(m1_adhd_add, m2_adhd_int, 
+          dv.labels = c("ADHD Additive", "ADHD Interactive"),
+          pred.labels = c(
+            "(Intercept)" = "(Intercept)",
+            "stacked_pred_z_dev" = "ĝ<sub>deviation</sub>",
+            "stacked_pred_z_mean" = "ĝ<sub>mean</sub>",
+            "ADHDdiagnosisADHD" = "ADHD Diagnosis",
+            "stacked_pred_z_dev:ADHDdiagnosisADHD" = "ĝ<sub>deviation</sub> × ADHD",
+            "stacked_pred_z_mean:ADHDdiagnosisADHD" = "ĝ<sub>mean</sub> × ADHD"),
+          show.aic = TRUE,
+          show.dev = TRUE,
+          title = "ADHD Diagnosis Comparison",
+          file = "adhd_diagnosis")
+```
+
+# SJPlot Tables: Symptom models
+```{r sjplot_hyp}
+tab_model(m6p5_hyper, m6_hyper, 
+          dv.labels = c("Hyperactivity only", "Neuroimaging-and-Hyperactivity"),
+          pred.labels = c(
+            "(Intercept)" = "Intercept",
+            "stacked_pred_z_dev" = "ĝ<sub>deviation</sub>",
+            "stacked_pred_z_mean" = "ĝ<sub>mean</sub>",
+            "ADHDdiagnosisADHD" = "ADHD Diagnosis",
+            "stacked_pred_z_dev:ADHDdiagnosisADHD" = "ĝ<sub>deviation</sub> × ADHD",
+            "stacked_pred_z_mean:ADHDdiagnosisADHD" = "ĝ<sub>mean</sub> × ADHD",
+            "HyperactivityMean" = "Hyperactivity<sub>mean</sub>",
+            "HyperactivityDeviation" = "Hyperactivity<sub>deviation</sub>"
+          ),
+          show.aic = TRUE,
+          show.dev = TRUE,
+          title = "Symptoms Comparison",
+          file = "symptom_models")
+```
+
+```{r sjplot_inatt}
+tab_model(m7p5_inatt, m7_inatt, 
+          dv.labels = c("Inattention Only", "Neuroimaging-and-Inattention"),
+          pred.labels = c(
+            "(Intercept)" = "Intercept",
+            "stacked_pred_z_dev" = "ĝ<sub>deviation</sub>",
+            "stacked_pred_z_mean" = "ĝ<sub>mean</sub>",
+            "ADHDdiagnosisADHD" = "ADHD Diagnosis",
+            "stacked_pred_z_dev:ADHDdiagnosisADHD" = "ĝ<sub>deviation</sub> × ADHD",
+            "stacked_pred_z_mean:ADHDdiagnosisADHD" = "ĝ<sub>mean</sub> × ADHD",
+            "InattentionMean" = "Inattention<sub>mean</sub>",
+            "InattentionDeviation" = "Inattention<sub>deviation</sub>" 
+          ),
+          show.aic = TRUE,
+          show.dev = TRUE,
+          title = "Symptoms Comparison",
+          file = "symptom_models")
+```
+
+# R2 Decomposition: Model 5
+```{r m5_r2_calculation}
+# Calculate R-squared for Model 5
+r2_m5 <- r2mlm::r2mlm(m5_neuro_age)
+print("Model 5 R-squared:")
+print(r2_m5)
+```
+
+# Commonality Analysis: Model 5
+```{r m5_commonality}
+# Refit using lme4 for glmm.hp compatibility
+m5_lme4 <- lme4::lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + age_deviation + age_mean + (1 | participant_id), 
+                      data = analysis_data, REML = FALSE)
+
+# Run commonality analysis
+m5_commonality_results <- glmm.hp::glmm.hp(m5_lme4, type = "adjR2", commonality = TRUE)
+print("Model 5 Commonality Results:")
+print(m5_commonality_results)
+```
+
+# Adjust Commonality: Model 5
+```{r m5_adjust_commonality}
+# Extract commonality analysis results
+m5_commonality_raw <- m5_commonality_results$commonality.analysis
+
+# Remove total rows
+is_total_row <- grepl("total|Total|TOTAL", rownames(m5_commonality_raw), ignore.case = TRUE)
+m5_components_only <- m5_commonality_raw[!is_total_row, , drop = FALSE]
+
+# Set negative values to zero
+m5_components_positive <- ifelse(m5_components_only[,1] < 0, 0, m5_components_only[,1])
+names(m5_components_positive) <- rownames(m5_components_only)
+
+# Re-normalize to 100%
+m5_sum_positive <- sum(m5_components_positive)
+m5_components_adjusted_pct <- (m5_components_positive / m5_sum_positive) * 100
+
+# Create adjusted results table
+m5_commonality_adjusted <- data.frame(
+  Component = rownames(m5_components_only),
+  Original_Fraction = m5_components_only[,1],
+  Original_Percent = m5_components_only[,2],
+  Adjusted_Fraction = m5_components_positive,
+  Adjusted_Percent = m5_components_adjusted_pct,
+  stringsAsFactors = FALSE
+)
+
+# Add adjusted total row
+m5_total_row <- data.frame(
+  Component = "Total",
+  Original_Fraction = sum(m5_components_only[,1]),
+  Original_Percent = 100.00,
+  Adjusted_Fraction = m5_sum_positive,
+  Adjusted_Percent = 100.00,
+  stringsAsFactors = FALSE
+)
+
+# Combine
+m5_commonality_adjusted_final <- rbind(m5_commonality_adjusted, m5_total_row)
+print("Model 5 Adjusted Commonality:")
+print(m5_commonality_adjusted_final)
+```
+
+# Commonality Analysis: Model 6 (Hyperactivity)
+```{r m6_commonality}
+# Refit using lme4
+m6_lme4 <- lme4::lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + HyperactivityDeviation + HyperactivityMean + (1 | participant_id), 
+                      data = analysis_data, REML = FALSE)
+
+# Run commonality analysis
+m6_commonality_results <- glmm.hp::glmm.hp(m6_lme4, type = "adjR2", commonality = TRUE)
+print("Model 6 Commonality Results:")
+print(m6_commonality_results)
+```
+
+# Adjust Commonality: Model 6
+```{r m6_adjust_commonality}
+# Extract commonality analysis results
+m6_commonality_raw <- m6_commonality_results$commonality.analysis
+
+# Remove total rows
+is_total_row <- grepl("total|Total|TOTAL", rownames(m6_commonality_raw), ignore.case = TRUE)
+m6_components_only <- m6_commonality_raw[!is_total_row, , drop = FALSE]
+
+# Set negative values to zero
+m6_components_positive <- ifelse(m6_components_only[,1] < 0, 0, m6_components_only[,1])
+names(m6_components_positive) <- rownames(m6_components_only)
+
+# Re-normalize to 100%
+m6_sum_positive <- sum(m6_components_positive)
+m6_components_adjusted_pct <- (m6_components_positive / m6_sum_positive) * 100
+
+# Create adjusted results table
+m6_commonality_adjusted <- data.frame(
+  Component = rownames(m6_components_only),
+  Original_Fraction = m6_components_only[,1],
+  Original_Percent = m6_components_only[,2],
+  Adjusted_Fraction = m6_components_positive,
+  Adjusted_Percent = m6_components_adjusted_pct,
+  stringsAsFactors = FALSE
+)
+
+# Add adjusted total row
+m6_total_row <- data.frame(
+  Component = "Total",
+  Original_Fraction = sum(m6_components_only[,1]),
+  Original_Percent = 100.00,
+  Adjusted_Fraction = m6_sum_positive,
+  Adjusted_Percent = 100.00,
+  stringsAsFactors = FALSE
+)
+
+# Combine
+m6_commonality_adjusted_final <- rbind(m6_commonality_adjusted, m6_total_row)
+print("Model 6 Adjusted Commonality:")
+print(m6_commonality_adjusted_final)
+```
+
+# Commonality Analysis: Model 7 (Inattention)
+```{r m7_commonality}
+# Refit using lme4
+m7_lme4 <- lme4::lmer(true_g_z ~ stacked_pred_z_dev + stacked_pred_z_mean + InattentionDeviation + InattentionMean + (1 | participant_id), 
+                      data = analysis_data, REML = FALSE)
+
+# Run commonality analysis
+m7_commonality_results <- glmm.hp::glmm.hp(m7_lme4, type = "adjR2", commonality = TRUE)
+print("Model 7 Commonality Results:")
+print(m7_commonality_results)
+```
+
+# Adjust Commonality: Model 7
+```{r m7_adjust_commonality}
+# Extract commonality analysis results
+m7_commonality_raw <- m7_commonality_results$commonality.analysis
+
+# Remove total rows
+is_total_row <- grepl("total|Total|TOTAL", rownames(m7_commonality_raw), ignore.case = TRUE)
+m7_components_only <- m7_commonality_raw[!is_total_row, , drop = FALSE]
+
+# Set negative values to zero
+m7_components_positive <- ifelse(m7_components_only[,1] < 0, 0, m7_components_only[,1])
+names(m7_components_positive) <- rownames(m7_components_only)
+
+# Re-normalize to 100%
+m7_sum_positive <- sum(m7_components_positive)
+m7_components_adjusted_pct <- (m7_components_positive / m7_sum_positive) * 100
+
+# Create adjusted results table
+m7_commonality_adjusted <- data.frame(
+  Component = rownames(m7_components_only),
+  Original_Fraction = m7_components_only[,1],
+  Original_Percent = m7_components_only[,2],
+  Adjusted_Fraction = m7_components_positive,
+  Adjusted_Percent = m7_components_adjusted_pct,
+  stringsAsFactors = FALSE
+)
+
+# Add adjusted total row
+m7_total_row <- data.frame(
+  Component = "Total",
+  Original_Fraction = sum(m7_components_only[,1]),
+  Original_Percent = 100.00,
+  Adjusted_Fraction = m7_sum_positive,
+  Adjusted_Percent = 100.00,
+  stringsAsFactors = FALSE
+)
+
+# Combine
+m7_commonality_adjusted_final <- rbind(m7_commonality_adjusted, m7_total_row)
+print("Model 7 Adjusted Commonality:")
+print(m7_commonality_adjusted_final)
+```
+
+# Export R2 Decomposition: Model 5
+```{r export_m5_r2_decomposition}
+# Export R2 Decomposition: Model 5 - CORRECTED
+# Preserve the matrix structure (total/within/between columns)
+
+r2_decomposition <- r2mlm::r2mlm(m5_neuro_age)
+
+# Extract the Decompositions matrix
+decomp_matrix <- r2_decomposition$Decompositions
+
+# Create dataframe with proper row and column labels
+decomp_df <- data.frame(
+  component = rownames(decomp_matrix),
+  total = decomp_matrix[, "total"],
+  within = decomp_matrix[, "within"],
+  between = decomp_matrix[, "between"],
+  stringsAsFactors = FALSE
+)
+
+# Export for Python
+write.csv(decomp_df, "m5_r2mlm_decomposition.csv", row.names = FALSE)
+cat("Exported Model 5 R2 decomposition to m5_r2mlm_decomposition.csv\n")
+```
+
+# Export Adjusted Commonality: All Models
+```{r export_commonality}
+# Export Model 5 adjusted commonality
+write.csv(m5_commonality_adjusted_final, "m5_neuro_age_commonality_adjusted.csv", row.names = FALSE)
+cat("Exported Model 5 adjusted commonality to m5_neuro_age_commonality_adjusted.csv\n")
+
+# Export Model 6 adjusted commonality
+write.csv(m6_commonality_adjusted_final, "m6_hyperactivity_commonality_adjusted.csv", row.names = FALSE)
+cat("Exported Model 6 adjusted commonality to m6_hyperactivity_commonality_adjusted.csv\n")
+
+# Export Model 7 adjusted commonality
+write.csv(m7_commonality_adjusted_final, "m7_inattention_commonality_adjusted.csv", row.names = FALSE)
+cat("Exported Model 7 adjusted commonality to m7_inattention_commonality_adjusted.csv\n")
+```
+
+```{r hyperactivity_commonality_viz_filled}
+# Hyperactivity Variance Decomposition - Four-way Euler Structure
+library(eulerr)
+
+# -------------------------------------------------------------------------
+# DEFINE DATA
+# -------------------------------------------------------------------------
+# Data extracted from m6_hyperactivity_commonality_adjusted.csv (Adjusted_Percent)
+# "Within"  = stacked_pred_z_dev
+# "Between" = stacked_pred_z_mean
+# "HypDev"  = HyperactivityDeviation
+# "HypMean" = HyperactivityMean
+
+variance_data_4way <- c(
+  # 1. Unique Variances
+  "Within"  = 13.83,
+  "Between" = 47.04,
+  "HypDev"  = 0.00,   # Adjusted unique variance is 0 (fully shared)
+  "HypMean" = 15.97,
+
+  # 2. Pairwise Intersections
+  "Between&Within"  = 0.21,
+  "HypDev&Within"   = 4.45,
+  "Between&HypDev"  = 6.09,
+  "HypMean&Within"  = 0.11,
+  "Between&HypMean" = 12.22,
+  "HypDev&HypMean"  = 0.00,
+
+  # 3. Three-way Intersections
+  "Between&HypDev&Within"  = 0.00,
+  "Between&HypMean&Within" = 0.00,
+  "HypDev&HypMean&Within"  = 0.04,
+  "Between&HypDev&HypMean" = 0.00,
+
+  # 4. Four-way Intersection
+  "Between&HypDev&HypMean&Within" = 0.04
+)
+
+print("Hyperactivity four-way variance data:")
+print(variance_data_4way)
+
+# -------------------------------------------------------------------------
+# GENERATE EULER DIAGRAM
+# -------------------------------------------------------------------------
+# shape = "ellipse" allows the geometry to distort to fit the 0 variance subsets
+euler_fit_4way <- euler(variance_data_4way, 
+                        shape = "ellipse", 
+                        control = list(extraopt = TRUE))
+
+print(paste("Fit stress:", round(euler_fit_4way$stress, 4)))
+print(paste("Diag Error:", round(euler_fit_4way$diagError, 4)))
+
+# -------------------------------------------------------------------------
+# PLOT
+# -------------------------------------------------------------------------
+p_euler_4way <- plot(euler_fit_4way,
+     quantities = FALSE, #list(type = "percent", font = 2, round = 1),
+     # Adjust colors as preferred
+     fills = c("lightblue", "lightcoral", "lightgreen", "lightyellow"), 
+     edges = list(col = "black", lwd = 1.0),
+     labels = FALSE, #list(font = 2), 
+     legend = TRUE,
+     main = "Hyperactivity Variance Decomposition")
+
+print(p_euler_4way)
+``` 
+```{r euler for inattention}
+# Inattention Variance Decomposition - Four-way Euler Structure
+library(eulerr)
+
+
+# DEFINE DATA
+
+variance_data_inatt <- c(
+  # 1. Unique Variances
+  "Within"    = 10.39,
+  "Between"   = 36.12,
+  "InattDev"  = 0.00,   # Unique variance is 0
+  "InattMean" = 33.03,
+
+  # 2. Pairwise Intersections
+  "Between&Within"    = 0.08,
+  "InattDev&Within"   = 3.90,
+  "Between&InattDev"  = 4.86,
+  "InattMean&Within"  = 1.01,
+  "Between&InattMean" = 10.59,
+  "InattDev&InattMean"= 0.00,
+
+  # 3. Three-way Intersections (All effectively 0 in this dataset)
+  "Between&InattDev&Within"    = 0.00,
+  "Between&InattMean&Within"   = 0.00,
+  "InattDev&InattMean&Within"  = 0.00,
+  "Between&InattDev&InattMean" = 0.00,
+
+  # 4. Four-way Intersection
+  "Between&InattDev&InattMean&Within" = 0.00
+)
+
+print("Inattention four-way variance data:")
+print(variance_data_inatt)
+
+# -------------------------------------------------------------------------
+# GENERATE EULER DIAGRAM
+# -------------------------------------------------------------------------
+# shape = "ellipse" is used to try and handle the disjoint/0-variance structure
+euler_fit_inatt <- euler(variance_data_inatt, 
+                         shape = "ellipse", 
+                         control = list(extraopt = TRUE))
+
+print(paste("Fit stress:", round(euler_fit_inatt$stress, 4)))
+print(paste("Diag Error:", round(euler_fit_inatt$diagError, 4)))
+
+# -------------------------------------------------------------------------
+# PLOT
+# -------------------------------------------------------------------------
+p_euler_inatt <- plot(euler_fit_inatt,
+     quantities = FALSE, #list(type = "percent", font = 2, round = 1),
+     # Adjust colors here
+     fills = c("lightblue", "lightcoral", "lightgreen", "lightyellow"), 
+     edges = list(col = "black", lwd = 1.0),
+     labels = FALSE, #list(font = 2), 
+     legend = TRUE,
+     main = "Inattention Variance Decomposition")
+
+print(p_euler_inatt)
+
+``` 
+```{r Export for spaghetti plot symptoms}
+# Export Data for Python Visualization
+# Selects participants with >1 timepoint (already filtered in analysis_data)
+# Includes raw variables and stable phenotype labels for plotting
+viz_export_data <- analysis_data %>%
+  select(
+    subject_id,
+    participant_id,
+    Age,             # Raw Age for X-axis
+    sex,             # Included in case you need to split/hue by sex
+    ADHDdiagnosis,   # The stable phenotype (Control/ADHD) for Hue
+    InattentionRaw,  # Raw Symptom Score
+    HyperactivityRaw,# Raw Symptom Score
+    true_g,          # Raw Cognition Score
+    stacked_pred     # Raw Model Prediction
+  )
+
+# Write to CSV
+write.csv(viz_export_data, "longitudinal_phenotype_symptom_data.csv", row.names = FALSE)
+
+cat("Exported visualization dataset to 'longitudinal_phenotype_symptom_data.csv' with", nrow(viz_export_data), "rows.\n")
+```

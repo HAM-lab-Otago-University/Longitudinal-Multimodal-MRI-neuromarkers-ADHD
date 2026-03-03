@@ -1,0 +1,800 @@
+---
+title: "Regularized G-Factor Model for OREGON1000 Cognitive Data"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  html_notebook:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+This R Notebook implements a regularized g-factor model for cognitive data from the OREGON1000 dataset. The regularized approach adds a small constant to the diagonal of the covariance matrix to improve numerical stability while maintaining all variables as continuous.
+
+# Libraries
+
+```{r load_libraries}
+library(data.table)
+library(psych) 
+library(lavaan)
+library(lavaanPlot)
+library(ggplot2)
+library(corrplot)
+library(dplyr)
+```
+
+# Set working directory
+
+```{r set_directory}
+# Set working directory
+knitr::opts_knit$set(root.dir ='/media/hcs-sci-psy-narun/Jack/g_factor_analysis_v5_nested')
+```
+
+# Upload train and test sets 
+
+```{r load_data}
+base_path <- "/media/hcs-sci-psy-narun/Jack/g_factor_analysis_v5_nested/fold_"
+file_names <- c("cogscores_12T_i2_train_with_id_scaled_fold_", "cogscores_12T_i2_test_with_id_scaled_fold_")
+
+for (i in 0:4) {
+  assign(paste0("train_", i), read.csv(paste0(base_path, i, "/cogscores/", file_names[1], i, ".csv"), header = TRUE))
+  assign(paste0("test_", i), read.csv(paste0(base_path, i, "/cogscores/", file_names[2], i, ".csv"), header = TRUE))
+}
+```
+
+# Validate independent fold structure
+
+```{r validate_folds}
+# Function to extract subject IDs from timepoint IDs
+extract_subject_id <- function(timepoint_ids) {
+  subject_ids <- sapply(strsplit(timepoint_ids, "_"), function(x) x[1])
+  return(unique(subject_ids))
+}
+
+# Updated validation function for nested cross-validation
+validate_nested_cv_folds <- function() {
+  cat("=== NESTED CV FOLD VALIDATION ===\n")
+  validation_passed <- TRUE
+  
+  # Track subject appearances across all folds
+  subject_appearances <- list()
+  
+  # Get all subjects from all folds and track their appearances
+  for (i in 0:4) {
+    # Get train and test dataframes
+    train_df <- get(paste0("train_", i))
+    test_df <- get(paste0("test_", i))
+    
+    # Extract subject IDs from timepoint IDs
+    train_subjects <- extract_subject_id(train_df$eid)
+    test_subjects <- extract_subject_id(test_df$eid)
+    
+    cat(paste("Outer Fold", i, ": Train subjects =", length(train_subjects), 
+              ", Test subjects =", length(test_subjects), "\n"))
+    
+    # Check for subject overlap between train and test WITHIN this outer fold
+    overlap <- intersect(train_subjects, test_subjects)
+    if (length(overlap) > 0) {
+      cat(paste("VALIDATION FAILED! Outer fold", i, "has", length(overlap), 
+                "subjects in both train and test sets!\n"))
+      validation_passed <- FALSE
+    } else {
+      cat(paste("✓ Outer fold", i, ": No subject overlap between train and test\n"))
+    }
+    
+    # Track appearances for nested CV validation
+    for (subject in train_subjects) {
+      if (is.null(subject_appearances[[subject]])) {
+        subject_appearances[[subject]] <- list(train_folds = c(), test_folds = c())
+      }
+      subject_appearances[[subject]]$train_folds <- c(subject_appearances[[subject]]$train_folds, i)
+    }
+    
+    for (subject in test_subjects) {
+      if (is.null(subject_appearances[[subject]])) {
+        subject_appearances[[subject]] <- list(train_folds = c(), test_folds = c())
+      }
+      subject_appearances[[subject]]$test_folds <- c(subject_appearances[[subject]]$test_folds, i)
+    }
+  }
+  
+  # Validate nested CV pattern: each subject should appear in exactly 4 train folds and 1 test fold
+  nested_cv_valid <- TRUE
+  for (subject in names(subject_appearances)) {
+    n_train <- length(subject_appearances[[subject]]$train_folds)
+    n_test <- length(subject_appearances[[subject]]$test_folds)
+    
+    if (n_train != 4 || n_test != 1) {
+      cat(paste("NESTED CV VIOLATION! Subject", subject, "appears in", n_train, 
+                "train folds and", n_test, "test folds (should be 4 train, 1 test)\n"))
+      nested_cv_valid <- FALSE
+      validation_passed <- FALSE
+    }
+  }
+  
+  if (nested_cv_valid) {
+    cat("✓ Nested CV structure is valid: Each subject appears in exactly 4 train folds and 1 test fold\n")
+  }
+  
+  # Final validation status
+  if (validation_passed) {
+    cat("✓ All nested CV validations passed\n")
+  } else {
+    cat("✗ VALIDATION FAILED: Issues detected in nested CV structure\n")
+  }
+  cat("=== NESTED CV VALIDATION COMPLETE ===\n")
+  
+  return(validation_passed)
+}
+
+# Run the updated validation
+fold_validation_result <- validate_nested_cv_folds()
+```
+
+# Parse timepoint IDs and prepare data
+
+```{r parse_timepoints}
+# Function to extract components from timepoint ID
+extract_timepoint_info <- function(df) {
+  # Create a copy to avoid modifying the original
+  result <- df
+  
+  # Extract subject ID and age information
+  result$subject_id <- sapply(result$eid, function(id) {
+    parts <- strsplit(as.character(id), "_")[[1]]
+    return(parts[1])
+  })
+  
+  # Extract age information if available
+  result$age_info <- sapply(result$eid, function(id) {
+    parts <- strsplit(as.character(id), "_")[[1]]
+    if (length(parts) > 1) {
+      age_part <- parts[2]
+      if (grepl("^Age", age_part)) {
+        return(age_part)
+      }
+    }
+    return(NA)
+  })
+  
+  # Try to extract numeric age in years
+  result$age_years <- sapply(result$age_info, function(age_info) {
+    if (is.na(age_info)) return(NA)
+    if (grepl("^Age[0-9]{2}[0-9]$", age_info)) {
+      # Format is "AgeXXY" where XX=years, Y=months
+      years <- as.numeric(substr(age_info, 4, 5))
+      months <- as.numeric(substr(age_info, 6, 6))
+      return(years + months/12)
+    }
+    return(NA)
+  })
+  
+  return(result)
+}
+
+# Apply the function to each dataset
+for (i in 0:4) {
+  train_name <- paste0("train_", i)
+  test_name <- paste0("test_", i)
+  
+  assign(train_name, extract_timepoint_info(get(train_name)))
+  assign(test_name, extract_timepoint_info(get(test_name)))
+}
+```
+
+
+# Create nice variable names for visualization
+
+```{r nice_names}
+# Create mapping for nice display names
+nice_names <- c(
+  # Stop Signal Task
+  stop_sdgort = "Stop Task SD of Go RT",
+  
+  # Continuous Performance Task
+  dprime1 = "CPT D-prime (Catch)",
+  
+  # N-Back Task
+  n2backacc = "N-Back 2-back Accuracy",
+  
+  # WISC Digit Span
+  digitspan_dsfscore = "Digit Span Forward",
+  digitspan_dsbscore = "Digit Span Backward",
+  
+  # WIAT Achievement Test
+  wordread_score = "WIAT Word Reading"
+)
+
+# Helper function to get nice names
+get_nice_name <- function(var_name) {
+  for (pattern in names(nice_names)) {
+    if (grepl(pattern, var_name, fixed = TRUE)) {
+      return(nice_names[pattern])
+    }
+  }
+  return(var_name)
+}
+```
+
+# Remove non-cognitive columns for analysis
+
+```{r remove_non_cognitive}
+# Function to remove non-cognitive columns
+remove_columns <- function(df) {
+  # Keep a copy of the eid column to add back later
+  eid_col <- df$eid
+  
+  # Remove non-cognitive columns
+  df <- subset(df, select = -c(eid, subject_id, age_info, age_years))
+  
+  return(list(df = df, eid = eid_col))
+}
+
+# Apply the function to each data frame
+for (i in 0:4) {
+  train_name <- paste0("train_", i)
+  test_name <- paste0("test_", i)
+  
+  # Process train set
+  train_result <- remove_columns(get(train_name))
+  assign(paste0("train_", i, "_eid"), train_result$eid)
+  assign(train_name, train_result$df)
+  
+  # Process test set
+  test_result <- remove_columns(get(test_name))
+  assign(paste0("test_", i, "_eid"), test_result$eid)
+  assign(test_name, test_result$df)
+}
+```
+
+```{r missingness}
+# Check missingness patterns
+cognitive_vars <- c("n2backacc", "dprime1", "stop_sdgort", 
+                   "digitspan_dsfscore", "digitspan_dsbscore", "wordread_score")
+sapply(cognitive_vars, function(x) sum(is.na(x))/length(x))
+
+```
+
+
+# Examine correlation patterns in dataset
+
+```{r correlation_matrix, fig.width=10, fig.height=8}
+# Calculate correlation matrix for fold 0
+correlation_matrix <- cor(train_0, use = "pairwise.complete.obs")
+
+# Create nicer labels for visualization
+nice_labels <- sapply(colnames(correlation_matrix), get_nice_name)
+rownames(correlation_matrix) <- nice_labels
+colnames(correlation_matrix) <- nice_labels
+
+# Create improved correlation plot
+corrplot(correlation_matrix, 
+         method = "color",       # Colored squares
+         type = "upper",         # Only upper triangle 
+         tl.col = "black",       # Black text labels
+         tl.srt = 45,            # Angled text
+         tl.cex = 0.9,           # Slightly larger text
+         cl.cex = 0.9,           # Slightly larger legend text
+         addCoef.col = "black",  # Black numbers
+         number.cex = 0.8,       # Slightly smaller numbers
+         number.digits = 2,      # Only show 2 decimal places
+         diag = FALSE,           # Don't show diagonal (always 1)
+         title = "Correlation Matrix of Cognitive Variables")
+```
+
+# Regularized G-Factor Model
+
+## Create direct model syntax
+
+```{r define_model}
+# Create a direct one-factor model (g factor) syntax
+direct_model_syntax <- "g =~ stopsig_stop_sdgort + cpth_dprime1 + nback_n2backacc + 
+                         wisc_digitspan_dsfscore + wisc_digitspan_dsbscore + 
+                         wiat_wordread_score"
+```
+
+## Function for regularized model fitting
+
+```{r regularized_approach}
+# Function to fit with regularized covariance
+fit_regularized <- function(data, fold_idx) {
+  cat(paste0("\n====== Fold ", fold_idx, " - Regularized Approach ======\n"))
+  
+  tryCatch({
+    # Calculate covariance matrix
+    cov_matrix <- cov(data, use = "pairwise.complete.obs")
+    
+    # Add small constant to diagonal for regularization
+    diag(cov_matrix) <- diag(cov_matrix) + 0.05
+    
+    # Fit model using the regularized covariance matrix
+    model_fit <- cfa(direct_model_syntax, 
+                     sample.cov = cov_matrix,
+                     sample.nobs = nrow(data),
+                     std.lv = TRUE,
+                     missing = "fiml")  # FIML for handling any remaining missing data
+    
+    fit_summary <- summary(model_fit, fit.measures = TRUE, standardized = TRUE)
+    print(fit_summary)
+    return(model_fit)
+  }, error = function(e) {
+    cat("Model did not converge. Error:", e$message, "\n")
+    return(NULL)
+  })
+}
+```
+
+## Fit models for each fold
+
+```{r fit_models}
+# Fit models for each fold
+regularized_fits <- list()
+for (i in 0:4) {
+  regularized_fits[[i+1]] <- fit_regularized(get(paste0("train_", i)), i)
+}
+```
+
+## Visualize the model
+
+```{r model_visualization, fig.width=10, fig.height=8}
+# Function to create lavaan plot for the model
+create_lavaan_plot <- function(model) {
+  if (is.null(model)) return(NULL)
+  
+  # Create a model visualization
+  plot <- lavaanPlot(model = model, 
+                    node_options = list(shape = "box", fontname = "Helvetica"),
+                    edge_options = list(color = "grey"), 
+                    coefs = TRUE,
+                    stand = TRUE,
+                    sig = 0.05)
+  
+  return(plot)
+}
+
+# Create and show plot for first fold
+model_plot <- create_lavaan_plot(regularized_fits[[1]])
+if (!is.null(model_plot)) {
+  print(model_plot)
+}
+```
+
+## Examine loadings across folds
+
+```{r examine_loadings, fig.width=10, fig.height=6}
+# Function to extract loadings
+extract_loadings <- function(model) {
+  if (is.null(model)) return(NULL)
+  
+  tryCatch({
+    # Get standardized solution
+    solution <- standardizedSolution(model)
+    
+    # Extract loadings (rows with operator "=~")
+    loadings <- solution[solution$op == "=~", ]
+    
+    # Create a data frame with variable names and loadings
+    result <- data.frame(
+      Variable = loadings$rhs,
+      Loading = loadings$est.std
+    )
+    
+    # Add nice names
+    result$Nice_Name <- sapply(result$Variable, get_nice_name)
+    
+    return(result)
+  }, error = function(e) {
+    return(NULL)
+  })
+}
+
+# Get and compare loadings across folds
+all_loadings <- data.frame()
+
+for (i in 0:4) {
+  fold_loadings <- extract_loadings(regularized_fits[[i+1]])
+  
+  if (!is.null(fold_loadings)) {
+    fold_loadings$Fold <- paste("Fold", i)
+    all_loadings <- rbind(all_loadings, fold_loadings)
+  }
+}
+
+# Create comparison plot
+if (nrow(all_loadings) > 0) {
+  ggplot(all_loadings, aes(x = Nice_Name, y = Loading, fill = Fold)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    coord_flip() +
+    labs(title = "Comparison of G-Factor Loadings Across Folds",
+         x = "Cognitive Variable",
+         y = "Loading") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+```
+
+# Extract G-Factor Scores
+
+```{r extract_scores}
+save_path <- '/media/hcs-sci-psy-narun/Jack/g_factor_analysis_v6_nested_rework/'
+
+# Calculate g-factor scores using regression method
+for (i in 0:4) {
+  # Skip if model did not converge
+  if (is.null(regularized_fits[[i+1]])) {
+    cat(paste0("Skipping fold ", i, " as model did not converge\n"))
+    next
+  }
+  
+  # Get model
+  model <- regularized_fits[[i+1]]
+  
+  # Get data
+  train_data <- get(paste0("train_", i))
+  test_data <- get(paste0("test_", i))
+  
+  # Get original IDs
+  train_ids <- get(paste0("train_", i, "_eid"))
+  test_ids <- get(paste0("test_", i, "_eid"))
+  
+  tryCatch({
+    # Extract standardized loadings for g-factor
+    loadings <- standardizedSolution(model)
+    g_loadings <- loadings[loadings$op == "=~" & loadings$lhs == "g", ]
+    
+    # Variables in the model
+    model_vars <- g_loadings$rhs
+    
+    # FIXED function to compute g-factor scores (handles pre-scaled data)
+    compute_g_scores <- function(data, vars, loadings, fold_name = paste0("fold_", i)) {
+      cat(paste0("\n--- Computing G-scores for ", fold_name, " ---\n"))
+      
+      # Check if data is already standardized
+      means <- colMeans(data[, vars], na.rm = TRUE)
+      sds <- apply(data[, vars], 2, sd, na.rm = TRUE)
+      
+      cat("Input data statistics:\n")
+      for (j in 1:min(3, length(vars))) {
+        cat(paste0("  ", vars[j], ": mean=", round(means[j], 4), ", sd=", round(sds[j], 4), "\n"))
+      }
+      
+      # Check if data appears to be already standardized
+      already_scaled <- all(abs(means) < 0.2) && all(abs(sds - 1) < 0.3)
+      
+      if (already_scaled) {
+        cat("*** DATA APPEARS ALREADY STANDARDIZED - USING DIRECTLY ***\n")
+        cat("*** AVOIDING DOUBLE-STANDARDIZATION ***\n")
+        
+        # Use data as-is since it's already scaled
+        scaled_data <- as.matrix(data[, vars])
+        
+        # Replace NAs with 0 (which is the mean in standardized data)
+        scaled_data[is.na(scaled_data)] <- 0
+        
+      } else {
+        cat("*** DATA NOT STANDARDIZED - APPLYING STANDARDIZATION ***\n")
+        
+        # Create matrix for scaled data
+        scaled_data <- matrix(NA, nrow = nrow(data), ncol = length(vars))
+        colnames(scaled_data) <- vars
+        
+        # Scale each column
+        for (j in 1:length(vars)) {
+          var <- vars[j]
+          if (sds[j] > 0) {
+            scaled_data[, j] <- (data[, var] - means[j]) / sds[j]
+          } else {
+            scaled_data[, j] <- 0  # Handle zero variance
+            cat(paste0("Warning: Zero variance in ", var, "\n"))
+          }
+        }
+        
+        # Replace NAs with 0 (mean after standardization)
+        scaled_data[is.na(scaled_data)] <- 0
+      }
+      
+      # Compute scores using loadings
+      scores <- scaled_data %*% matrix(loadings$est.std, ncol = 1)
+      
+      cat("Pre-standardization g-scores:\n")
+      cat(paste0("  Mean: ", round(mean(scores), 4), "\n"))
+      cat(paste0("  SD: ", round(sd(scores), 4), "\n"))
+      cat(paste0("  Range: [", round(min(scores), 4), ", ", round(max(scores), 4), "]\n"))
+      
+      # Standardize the final scores to have mean 0 and SD 1
+      scores <- scale(scores)
+      
+      cat("Final g-scores:\n")
+      cat(paste0("  Mean: ", round(mean(scores), 4), "\n"))
+      cat(paste0("  SD: ", round(sd(scores), 4), "\n"))
+      cat(paste0("  Range: [", round(min(scores), 4), ", ", round(max(scores), 4), "]\n"))
+      
+      # CRITICAL: Check correlations with original cognitive variables to detect inversion
+      cat("G-score correlations with original cognitive variables:\n")
+      inversion_detected <- FALSE
+      negative_correlations <- 0
+      
+      for (var in vars) {
+        if (var %in% names(data)) {
+          orig_values <- data[[var]]
+          valid_indices <- !is.na(orig_values)
+          
+          if (sum(valid_indices) > 10) {
+            corr_val <- cor(scores[valid_indices], orig_values[valid_indices], use = "complete.obs")
+            cat(paste0("  ", var, ": r=", round(corr_val, 4)))
+            
+            # Most cognitive tests should correlate positively with g-factor
+            # Exception: stop_sdgort (RT variability) should be negative
+            if (grepl("stop.*sdgort", var)) {
+              # RT variability should be negative
+              if (corr_val > -0.1) {
+                cat(" *** EXPECTED NEGATIVE but got positive - possible issue ***")
+              } else {
+                cat(" ✓ (expected negative)")
+              }
+            } else {
+              # All other tests should be positive
+              if (corr_val < -0.1) {
+                cat(" *** NEGATIVE - POTENTIAL PROBLEM ***")
+                negative_correlations <- negative_correlations + 1
+              } else {
+                cat(" ✓ (expected positive)")
+              }
+            }
+            cat("\n")
+          }
+        }
+      }
+      
+      # Check for systematic inversion
+      expected_positive_vars <- length(vars) - 1  # All except stop_sdgort
+      if (negative_correlations > expected_positive_vars * 0.5) {
+        cat("*** WARNING: MAJORITY OF CORRELATIONS ARE NEGATIVE ***\n")
+        cat("*** THIS SUGGESTS G-FACTOR MAY BE INVERTED ***\n")
+        inversion_detected <- TRUE
+      }
+      
+      # If inversion detected, could apply correction here
+      if (inversion_detected) {
+        cat("*** APPLYING AUTOMATIC INVERSION CORRECTION ***\n")
+        scores <- -scores
+        scores <- scale(scores)  # Re-standardize after flip
+        cat("G-factor scores have been inverted to correct direction\n")
+      }
+      
+      return(scores)
+    }
+    
+    # Compute scores with enhanced diagnostics
+    g_train_scores <- compute_g_scores(train_data, model_vars, g_loadings, paste0("fold_", i, "_train"))
+    g_test_scores <- compute_g_scores(test_data, model_vars, g_loadings, paste0("fold_", i, "_test"))
+    
+    # Create data frames with IDs
+    g_train <- data.frame(g = as.numeric(g_train_scores), eid = train_ids)
+    g_test <- data.frame(g = as.numeric(g_test_scores), eid = test_ids)
+    
+    # Save to global environment
+    assign(paste0("g_train_", i), g_train, envir = .GlobalEnv)
+    assign(paste0("g_test_", i), g_test, envir = .GlobalEnv)
+    
+    # Create directories if they don't exist
+    dir.create(file.path(save_path, paste0("fold_", i), "g"), recursive = TRUE, showWarnings = FALSE)
+    
+    # Save as csv
+    write.csv(g_train, file = file.path(save_path, paste0("fold_", i), "g", paste0("g_train_regularized_", i, ".csv")),
+              row.names = FALSE)
+    write.csv(g_test, file = file.path(save_path, paste0("fold_", i), "g", paste0("g_test_regularized_", i, ".csv")), row.names = FALSE)
+    
+    cat(paste0("Saved g-factor scores for fold ", i, "\n"))
+  }, error = function(e) {
+    cat(paste0("Error extracting g-factor scores for fold ", i, ": ", e$message, "\n"))
+  })
+}
+```
+
+# Combine all g-factor scores
+
+```{r combine_scores}
+# Updated score combination for nested CV
+combine_nested_cv_scores <- function() {
+  # Initialize tracking structures
+  all_g_train <- data.frame()
+  all_g_test <- data.frame()
+  
+  # Track which fold each score comes from
+  for (i in 0:4) {
+    # Check if g-factor scores exist for this fold
+    if (exists(paste0("g_train_", i))) {
+      fold_train <- get(paste0("g_train_", i))
+      fold_train$outer_fold <- i
+      fold_train$split_type <- "train"
+      all_g_train <- rbind(all_g_train, fold_train)
+    }
+    
+    if (exists(paste0("g_test_", i))) {
+      fold_test <- get(paste0("g_test_", i))
+      fold_test$outer_fold <- i
+      fold_test$split_type <- "test"
+      all_g_test <- rbind(all_g_test, fold_test)
+    }
+  }
+  
+  # Combine all scores with fold information
+  all_g_scores <- rbind(all_g_train, all_g_test)
+  
+  # Extract subject IDs for analysis
+  all_g_scores$subject_id <- sapply(all_g_scores$eid, function(id) {
+    strsplit(as.character(id), "_")[[1]][1]
+  })
+  
+  # Create separate datasets for different analyses
+  
+  # 1. Test scores only (each subject appears exactly once)
+  test_scores_only <- all_g_scores[all_g_scores$split_type == "test", ]
+  cat("Test scores (each subject once):", nrow(test_scores_only), "scores from", 
+      length(unique(test_scores_only$subject_id)), "unique subjects\n")
+  
+  # 2. All scores (for comprehensive analysis)
+  cat("All scores (subjects appear multiple times):", nrow(all_g_scores), "total scores\n")
+  
+  # 3. Average training scores per subject (average across the 4 training appearances)
+  train_scores <- all_g_scores[all_g_scores$split_type == "train", ]
+  avg_train_scores <- aggregate(g ~ subject_id, train_scores, mean)
+  avg_train_scores$split_type <- "train_averaged"
+  
+  # For timepoint IDs in averaged scores, we'll need to handle this differently
+  # since each subject has multiple train timepoints
+  
+  return(list(
+    all_scores = all_g_scores,
+    test_only = test_scores_only,
+    train_averaged = avg_train_scores
+  ))
+}
+
+# Extract the scores
+nested_cv_scores <- combine_nested_cv_scores()
+
+# Save different versions
+write.csv(nested_cv_scores$all_scores, 
+          file = file.path(save_path, "all_g_factor_scores_nested_cv_complete.csv"), 
+          row.names = FALSE)
+
+write.csv(nested_cv_scores$test_only, 
+          file = file.path(save_path, "all_g_factor_scores_nested_cv_test_only.csv"), 
+          row.names = FALSE)
+
+write.csv(nested_cv_scores$train_averaged, 
+          file = file.path(save_path, "all_g_factor_scores_nested_cv_train_averaged.csv"), 
+          row.names = FALSE)
+```
+
+# Analyze longitudinal patterns
+
+```{r longitudinal, fig.width=10, fig.height=6}
+# Updated longitudinal analysis for nested CV
+analyze_nested_cv_longitudinal <- function() {
+  # Load the processed data with all information
+  all_data_file <- file.path(save_path, "all_longitudinal_cognitive_data_processed.csv")
+  if (!file.exists(all_data_file)) {
+    cat("Processed data file not found. Skipping longitudinal analysis.\n")
+    return(NULL)
+  }
+  
+  all_data <- read.csv(all_data_file)
+  
+  # Option 1: Use only test scores (each subject appears once)
+  cat("\n=== LONGITUDINAL ANALYSIS USING TEST SCORES ONLY ===\n")
+  test_merged <- merge(nested_cv_scores$test_only, all_data, 
+                      by.x = "eid", by.y = "timepoint_id", all.x = TRUE)
+  
+  # Plot using test scores only
+  p1 <- ggplot(test_merged, aes(x = age_years, y = g)) +
+    geom_point(size = 2, alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "blue") +
+    labs(title = "G-Factor Scores by Age (Test Scores Only - Nested CV)",
+         subtitle = "Each subject appears exactly once",
+         x = "Age (years)",
+         y = "G-Factor Score") +
+    theme_minimal()
+  
+  print(p1)
+  
+  # Option 2: Use all scores but account for repeated measures
+  cat("\n=== LONGITUDINAL ANALYSIS USING ALL SCORES ===\n")
+  all_merged <- merge(nested_cv_scores$all_scores, all_data, 
+                     by.x = "eid", by.y = "timepoint_id", all.x = TRUE)
+  
+  # For subjects with multiple longitudinal timepoints, show trajectories
+  # But note that some "trajectories" will be artifacts of the CV structure
+  subjects_with_multiple_real_timepoints <- names(table(all_data$subject_id))[table(all_data$subject_id) > 1]
+  
+  if (length(subjects_with_multiple_real_timepoints) > 0) {
+    multi_timepoint_data <- all_merged[all_merged$subject_id %in% subjects_with_multiple_real_timepoints,]
+    
+    # Separate by split type for clearer visualization
+    p2 <- ggplot(multi_timepoint_data, aes(x = age_years, y = g, group = subject_id)) +
+      geom_line(alpha = 0.3) +
+      geom_point(aes(color = split_type, shape = factor(outer_fold)), size = 2) +
+      labs(title = "G-Factor Trajectories (Subjects with Multiple Real Timepoints)",
+           subtitle = "Colors indicate train/test split, shapes indicate outer fold",
+           x = "Age (years)",
+           y = "G-Factor Score",
+           color = "Split Type",
+           shape = "Outer Fold") +
+      theme_minimal()
+    
+    print(p2)
+  }
+  
+  # Option 3: Model validation - compare train vs test performance
+  cat("\n=== MODEL VALIDATION ANALYSIS ===\n")
+  
+  # For each outer fold, compare train and test score distributions
+  validation_stats <- data.frame()
+  
+  for (i in 0:4) {
+    fold_train <- nested_cv_scores$all_scores[nested_cv_scores$all_scores$outer_fold == i & 
+                                              nested_cv_scores$all_scores$split_type == "train", ]
+    fold_test <- nested_cv_scores$all_scores[nested_cv_scores$all_scores$outer_fold == i & 
+                                             nested_cv_scores$all_scores$split_type == "test", ]
+    
+    if (nrow(fold_train) > 0 && nrow(fold_test) > 0) {
+      validation_stats <- rbind(validation_stats, data.frame(
+        outer_fold = i,
+        train_mean = mean(fold_train$g, na.rm = TRUE),
+        train_sd = sd(fold_train$g, na.rm = TRUE),
+        test_mean = mean(fold_test$g, na.rm = TRUE),
+        test_sd = sd(fold_test$g, na.rm = TRUE),
+        train_n = nrow(fold_train),
+        test_n = nrow(fold_test)
+      ))
+    }
+  }
+  
+  # Plot validation statistics
+  if (nrow(validation_stats) > 0) {
+    library(reshape2)
+    means_long <- melt(validation_stats[, c("outer_fold", "train_mean", "test_mean")], 
+                      id.vars = "outer_fold", variable.name = "split", value.name = "mean_g")
+    
+    p3 <- ggplot(means_long, aes(x = factor(outer_fold), y = mean_g, fill = split)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      labs(title = "Mean G-Factor Scores by Fold and Split Type",
+           x = "Outer Fold",
+           y = "Mean G-Factor Score",
+           fill = "Split Type") +
+      theme_minimal()
+    
+    print(p3)
+    
+    # Print validation statistics
+    print(validation_stats)
+  }
+  
+  # Save merged datasets
+  write.csv(test_merged, 
+            file = file.path(save_path, "longitudinal_g_factor_nested_cv_test_only.csv"), 
+            row.names = FALSE)
+  
+  write.csv(all_merged, 
+            file = file.path(save_path, "longitudinal_g_factor_nested_cv_complete.csv"), 
+            row.names = FALSE)
+  
+  return(list(test_merged = test_merged, all_merged = all_merged, validation_stats = validation_stats))
+}
+
+# Run the analysis
+longitudinal_results <- analyze_nested_cv_longitudinal()
+```
+
+# Conclusion
+
+This analysis implements a regularized (small constant to covar matrix) g-factor model which treats all variables as continuous while providing improved numerical stability.
