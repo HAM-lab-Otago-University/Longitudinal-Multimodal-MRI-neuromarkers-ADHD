@@ -32,6 +32,7 @@ The analysis pipeline proceeds from raw fMRI preprocessing through feature extra
 SLURM array job scripts for running fMRIPrep and XCP-D used on the University of Otago's Aoraki cluster.
 
 | File | Description |
+|---|---|
 | `fmriprep_apptainer_one_single.sl` | fMRIPrep preprocessing, subject-timepoints 0-999 |
 | `fmriprep_apptainer_one_single_2.sl` | fMRIPrep preprocessing, subject-timepoints 1000-1217 |
 | `xcp_d_alff_acompcor_censorMT_12_5_2025.sl` | XCP-D post-processing with motion censoring (threshold), part 1 |
@@ -44,14 +45,15 @@ SLURM array job scripts for running fMRIPrep and XCP-D used on the University of
 Scripts that extract and compute brain imaging features and cognitive test scores from raw outputs.
 
 | File | Description |
+|---|---|
 | `Oregon_rest_connect_v18_rework.py` | Computes functional connectivity matrices from XCP-D parcellated time series; organises connectivity by Cole network ordering |
 | `Oregon_ALFF_ReHo_v7.py` | Extracts ALFF (uncensored) and ReHo (censored) parcel-level values from XCP-D outputs; maps to Glasser/HCP and Cole networks |
 | `Extract_cog_data_4_Gscore_v9.py` | Extracts cognitive test scores (N-Back, Stop Signal, Digit Span, etc.) from NDAR CSVs; creates 5-fold independent cross-validation splits |
 | `Extract_ADHD_RS_Data_4_NCV_v7_robust_pheno.py` | Extracts ADHD Rating Scale (inattention/hyperactivity) scores matched to the final neuroimaging sample using stable longitudinal phenotypes |
 
 ### `notebooks/`
-
 | File | Description |
+|---|---|
 | `01_OREGON_structural_tables_from_FSoutput.ipynb` | Extracts cortical area, cortical thickness, subcortical volume, and total brain volume from FreeSurfer outputs |
 
 ### `data_preparation/`
@@ -59,6 +61,7 @@ Scripts that extract and compute brain imaging features and cognitive test score
 Scripts for data quality control, modality alignment, and fold structure preparation.
 
 | File | Description |
+|---|---|
 | `Pre_processing_script_v7.py` | Organises all neuroimaging modality data into nested CV fold structures matching g-factor fold assignments |
 | `Modality_alignment_fix.py` | Aligns all neuroimaging modalities (structural and functional) to the functional connectivity subject-timepoint baseline |
 | `Cog_Inattention_alignment.py` | Aligns the stacked cognition predictions to the inattention dataset, retaining only matching observations |
@@ -68,11 +71,13 @@ Scripts for data quality control, modality alignment, and fold structure prepara
 ### `g_factor/`
 
 | File | Description |
+|---|---|
 | `G_Factor_Oregon_Regularized_simple_v2.Rmd` | Regularized confirmatory factor analysis (CFA) to estimate a general cognitive ability (g-factor) score for each subject-timepoint using lavaan; applied independently within each cross-validation fold |
 
 ### `models/`
 
 | File | Description |
+|---|---|
 | `First_level_model_v14.py` | Nested cross-validated first-level models (XGBoost, Kernel Ridge Regression, PLS Regression) for all neuroimaging modalities; designed for SLURM array job deployment |
 | `First_level_model_v14_FC_ONLY_1.py` | Variant of the first-level model optimised for the functional connectivity modality (reduced parallelism to manage large feature space memory requirements) |
 | `stacked_model_v11_ridge.py` | Stacked ridge regression ensemble that combines first-level model predictions across all modalities and model types into a final g-factor prediction |
@@ -81,6 +86,7 @@ Scripts for data quality control, modality alignment, and fold structure prepara
 ### `statistics/`
 
 | File | Description |
+|---|---|
 | `LME_Cognition_Biomarkers_symptoms_AIO_refactored.Rmd` | Linear mixed-effects models (lme4/lmerTest) relating stacked g-factor predictions to ADHD symptoms (inattention, hyperactivity) and neuroimaging biomarkers; includes R2mlm decomposition and hierarchical partitioning |
 | `LME_Cognition_Biomarkers_symptoms_AIO_refactored.html` | An HTML knit of the notebook 
 | `stacked_bootstrap_comparison_v9.py` | Bootstrap resampling analysis (n=5000) comparing stacked model performance against individual model-modality combinations using Fisher's z-transformation |
@@ -89,6 +95,7 @@ Scripts for data quality control, modality alignment, and fold structure prepara
 ### `visualisation/`
 
 | File | Description |
+|---|---|
 | `Stacked_Visualisations_v5.py` | Figure suite for the stacked model: predicted vs observed scatterplots, density heatmaps, longitudinal spaghetti plots stratified by phenotype |
 | `Stacked_vis_spaghetti_redo.py` | Revised spaghetti plot style for the stacked model; shows trajectory lines only for subjects with multiple timepoints, trend lines for Control and ADHD groups |
 | `first_level_model_visualizations_for_Manu.py` | Predicted vs observed scatterplots and spaghetti plots for all first-level model/modality combinations |
