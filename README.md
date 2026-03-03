@@ -1,6 +1,7 @@
 # Multimodal MRI-based neuromarkers trace longitudinal changes in cognitive functioning in ADHD
 
 **Authors** Scott, K.J., Konopkina, K., Khakpoor, F.L., Buianova, I., van der Vliet, W., & Pat, N.
+
 **Affiliation:** University of Otago  
 
 ---
