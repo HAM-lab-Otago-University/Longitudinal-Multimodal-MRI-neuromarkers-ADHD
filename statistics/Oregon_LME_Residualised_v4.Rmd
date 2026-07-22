@@ -1,0 +1,939 @@
+---
+title: "LME_Residualised_Sensitivity"
+author: "Jack Scott"
+date: "2026"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Setup
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = '/media/hcs-sci-psy-narun/Jack/First_level_model_aligned/Stacked_model_ridge_v4_EXTREME_conserve_a2000_keeper')
+```
+
+# Packages
+```{r packages}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(sjPlot)
+library(r2mlm)
+library(glmm.hp)
+library(broom.mixed)
+```
+
+# Data Loading
+```{r data_load}
+# -- Core neuroimaging/cognition data --
+cognition_data <- readr::read_csv(
+  "/media/hcs-sci-psy-narun/Jack/First_level_model_aligned/Stacked_model_ridge_v4_EXTREME_conserve_a2000_keeper/stacked_ridge_predictions.csv")
+
+phenotype_data <- read_csv(
+  "/media/hcs-sci-psy-narun/Jack/HMM_ELM_data_prep/phase4_statistical_analysis/analysis_ready_dataset.csv")
+
+inattention_scores   <- readr::read_csv(
+  "/media/hcs-sci-psy-narun/Jack/LME_cog_inattention/inattention_scores_matched.csv")
+hyperactivity_scores <- readr::read_csv(
+  "/media/hcs-sci-psy-narun/Jack/LME_cog_hyperactivity/hyperactivity_scores_matched.csv")
+
+# -- Residualisation covariates --
+
+# Volumes remaining post-censoring
+parse_xcpd_id <- function(df, col = "subject_id") {
+  df %>%
+    mutate(
+      stripped      = str_remove(.data[[col]], "^sub-"),
+      participant_id = str_extract(stripped, "^.+?(?=Age)"),
+      Age            = as.numeric(str_extract(stripped, "(?<=Age)\\d+(?=Months)"))
+    ) %>%
+    select(-stripped)
+}
+
+volumes_raw <- read_csv(
+  "/media/hcs-sci-psy-narun/Jack/Linear_mixed_effects_OREGON/volumes_censored_by_subject_summary.csv",
+  show_col_types = FALSE)
+
+volumes_clean <- volumes_raw %>%
+  parse_xcpd_id() %>%
+  select(participant_id, Age, perc_remaining_post_censoring)
+
+# Medication
+med_raw <- read_csv(
+  "/media/hcs-sci-psy-narun/Jack/meddem01.csv",
+  show_col_types = FALSE)
+
+med_clean <- med_raw %>%
+  mutate(
+    participant_id      = str_remove_all(subjectkey, "_"),
+    med_age             = as.numeric(interview_age),
+    current_stimmed_bin = case_when(current_stimmed == 3 ~ 1L,
+                                    current_stimmed == 1 ~ 0L,
+                                    TRUE                 ~ NA_integer_)
+  ) %>%
+  select(participant_id, med_age, current_stimmed_bin) %>%
+  filter(!is.na(current_stimmed_bin))
+
+# Euler number (structural surface quality: mean across hemispheres)
+euler_raw <- read_csv(
+  "/media/hcs-sci-psy-narun/Jack/oregon_adhd_1000_euler_metrics_v3.csv",
+  show_col_types = FALSE)
+
+euler_clean <- euler_raw %>%
+  parse_xcpd_id() %>%
+  mutate(mean_euler = (lh_euler + rh_euler) / 2) %>%
+  select(participant_id, Age, mean_euler)
+
+# Parental education (highest of mother/father, ordinal)
+edu_map <- c(
+  "Less than High School" = 0,
+  "Some High School"      = 1,
+  "High School Degree"    = 2,
+  "GED"                   = 2,
+  "Some College"          = 3,
+  "Associates Degree"     = 3,
+  "Bachelors Degree"      = 3,
+  "Graduate Degree"       = 3
+)
+
+socdem_raw <- read_csv(
+  "/media/hcs-sci-psy-narun/Jack/socdem01.csv",
+  show_col_types = FALSE)
+
+socdem_clean <- socdem_raw %>%
+  mutate(participant_id = str_remove_all(subjectkey, "_")) %>%
+  mutate(
+    bio_mother_education = ifelse(bio_mother_education %in% c(-999, 77), NA, bio_mother_education),
+    bio_father_education = ifelse(bio_father_education %in% c(-999, 77), NA, bio_father_education)
+  ) %>%
+  mutate(
+    mother_edu  = recode(bio_mother_education, !!!edu_map, .default = NA_real_),
+    father_edu  = recode(bio_father_education, !!!edu_map, .default = NA_real_),
+    highest_edu = pmax(mother_edu, father_edu, na.rm = TRUE)
+  ) %>%
+  group_by(participant_id) %>%
+  summarise(highest_edu = first(na.omit(highest_edu)), .groups = "drop")
+
+cat("Data loaded.\n")
+```
+
+# Data Preparation
+```{r data_prep}
+analysis_data_full <- cognition_data %>%
+  mutate(
+    participant_id = str_extract(subject_id, "^[^_]+"),
+    Age            = as.numeric(str_extract(subject_id, "(?<=_Age)\\d+"))
+  ) %>%
+  left_join(
+    phenotype_data %>%
+      mutate(subject_id_match = paste0(subject_id, "_Age", age_months)) %>%
+      select(subject_id_match, final_phenotype, sex),
+    by = c("subject_id" = "subject_id_match")
+  ) %>%
+  mutate(ADHDdiagnosis = factor(case_when(
+    final_phenotype == 3 ~ "ADHD",
+    final_phenotype == 1 ~ "Control",
+    TRUE ~ NA_character_
+  ), levels = c("Control", "ADHD"))) %>%
+  mutate(
+    InattentionRaw    = inattention_scores$inattention[match(subject_id, inattention_scores$subject_id)],
+    HyperactivityRaw  = hyperactivity_scores$hyperactivity[match(subject_id, hyperactivity_scores$subject_id)]
+  ) %>%
+  mutate(
+    participant_id   = as_factor(participant_id),
+    Age0             = Age - min(Age, na.rm = TRUE),
+    true_g_z         = as.double(scale(true_g)),
+    stacked_pred_z   = as.double(scale(stacked_pred)),
+    inattention_z    = as.double(scale(InattentionRaw)),
+    hyperactivity_z  = as.double(scale(HyperactivityRaw))
+  ) %>%
+  # Merge covariates (exact match on participant_id + Age)
+  left_join(volumes_clean, by = c("participant_id", "Age")) %>%
+  # Medication fuzzy match: nearest record within +/-6 months
+  left_join(med_clean, by = "participant_id", relationship = "many-to-many") %>%
+  mutate(age_diff = abs(Age - med_age)) %>%
+  filter(age_diff <= 6 | is.na(age_diff)) %>%
+  group_by(subject_id) %>%
+  slice_min(age_diff, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-med_age, -age_diff) %>%
+  # Parental education (time-invariant, join on participant_id)
+  left_join(socdem_clean, by = "participant_id") %>%
+  # Euler number (timepoint-level, join on participant_id + Age)
+  left_join(euler_clean %>% mutate(participant_id = as.character(participant_id)),
+            by = c("participant_id", "Age")) %>%
+  # Within/between decomposition and timepoint counting on full dataset
+  group_by(participant_id) %>%
+  mutate(
+    true_g_z_mean        = mean(true_g_z, na.rm = TRUE),
+    stacked_pred_z_mean  = mean(stacked_pred_z, na.rm = TRUE),
+    InattentionMean      = mean(inattention_z, na.rm = TRUE),
+    HyperactivityMean    = mean(hyperactivity_z, na.rm = TRUE),
+    age_mean             = mean(Age0, na.rm = TRUE),
+    count_timepoints     = n()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    true_g_z_dev         = true_g_z - true_g_z_mean,
+    stacked_pred_z_dev   = stacked_pred_z - stacked_pred_z_mean,
+    InattentionDeviation = inattention_z - InattentionMean,
+    HyperactivityDeviation = hyperactivity_z - HyperactivityMean,
+    age_deviation        = Age0 - age_mean
+  )
+
+cat("Full dataset:", nrow(analysis_data_full), "observations from",
+    n_distinct(analysis_data_full$participant_id), "participants.\n")
+```
+
+# Residualisation
+```{r residualisation}
+# Residualises stacked_pred_z from three confounds via OLS.
+# true_g_z is left unchanged, outcome static
+# Timepoints with missing confound data are excluded.
+# count_timepoints is recomputed after confound-complete filtering.
+
+# Filter to complete confound cases
+analysis_data_resid <- analysis_data_full %>%
+  filter(
+    !is.na(current_stimmed_bin),
+    !is.na(perc_remaining_post_censoring),
+    !is.na(highest_edu),
+    !is.na(mean_euler)
+  )
+
+cat("Timepoints after confound-complete filter:",
+    nrow(analysis_data_resid), "\n")
+
+# OLS residualisation of stacked predictions
+resid_model <- lm(
+  stacked_pred_z ~ current_stimmed_bin + perc_remaining_post_censoring + highest_edu + mean_euler,
+  data = analysis_data_resid
+)
+
+cat("\nResidualisation model summary:\n")
+print(summary(resid_model))
+
+# Extract residuals and z-standardise
+analysis_data_resid <- analysis_data_resid %>%
+  mutate(stacked_pred_z_resid = as.double(scale(residuals(resid_model))))
+
+# Recompute within/between decomposition on residualised predictions
+# count_timepoints recomputed after confound filter so the 2+ filter is accurate
+analysis_data_resid <- analysis_data_resid %>%
+  group_by(participant_id) %>%
+  mutate(
+    stacked_pred_z_resid_mean = mean(stacked_pred_z_resid, na.rm = TRUE),
+    count_timepoints_resid    = n()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    stacked_pred_z_resid_dev = stacked_pred_z_resid - stacked_pred_z_resid_mean
+  )
+
+# Longitudinal subset for LME analyses
+analysis_data_resid_lme <- analysis_data_resid %>%
+  filter(count_timepoints_resid >= 2)
+
+cat("Residualised longitudinal subset:",
+    nrow(analysis_data_resid_lme), "observations from",
+    n_distinct(analysis_data_resid_lme$participant_id), "participants.\n")
+
+# Overall correlation between residualised predictions and observed g
+r_resid <- cor(analysis_data_resid_lme$stacked_pred_z_resid,
+               analysis_data_resid_lme$true_g_z,
+               use = "complete.obs")
+cat(sprintf("Pearson r (residualised pred vs true g): %.3f\n", r_resid))
+```
+
+# Residualised Correlations: Overall, Inter- and Intraindividual
+```{r residualised_correlations}
+# Interindividual: correlation between person-level means
+participant_level_resid <- analysis_data_resid_lme %>%
+  distinct(participant_id, .keep_all = TRUE)
+
+r_resid_means <- cor(participant_level_resid$stacked_pred_z_resid_mean,
+                     participant_level_resid$true_g_z_mean,
+                     use = "complete.obs")
+
+# Intraindividual: correlation between within-person deviations
+r_resid_dev <- cor(analysis_data_resid_lme$stacked_pred_z_resid_dev,
+                   analysis_data_resid_lme$true_g_z_dev,
+                   use = "complete.obs")
+
+cat("=== Residualised Prediction Correlations ===\n")
+cat(sprintf("Overall:            r = %.3f,  R2 = %.4f  (N timepoints = %d)\n",
+            r_resid, r_resid^2, nrow(analysis_data_resid_lme)))
+cat(sprintf("Interindividual:    r = %.3f,  R2 = %.4f  (N participants = %d)\n",
+            r_resid_means, r_resid_means^2, nrow(participant_level_resid)))
+cat(sprintf("Intraindividual:    r = %.3f,  R2 = %.4f  (N timepoints = %d)\n",
+            r_resid_dev, r_resid_dev^2, nrow(analysis_data_resid_lme)))
+```
+
+# Model 1: ADHD Additive (Residualised)
+```{r m1_adhd_additive_resid}
+m1_adhd_add_resid <- lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             ADHDdiagnosis + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m1_adhd_add_resid)
+```
+
+# Model 2: ADHD Interactive (Residualised)
+```{r m2_adhd_interactive_resid}
+m2_adhd_int_resid <- lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             ADHDdiagnosis +
+             stacked_pred_z_resid_dev:ADHDdiagnosis +
+             stacked_pred_z_resid_mean:ADHDdiagnosis +
+             (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m2_adhd_int_resid)
+```
+
+# ADHD Model Comparison (Residualised)
+```{r adhd_comparison_resid}
+comp_adhd_resid <- anova(m1_adhd_add_resid, m2_adhd_int_resid)
+print(comp_adhd_resid)
+
+delta_bic_resid <- BIC(m2_adhd_int_resid) - BIC(m1_adhd_add_resid)
+cat("\nDelta BIC (Interactive - Additive):", round(delta_bic_resid, 2), "\n")
+if (delta_bic_resid > 0) {
+  cat("Evidence favours the simpler ADDITIVE model.\n")
+} else {
+  cat("Evidence favours the INTERACTIVE model.\n")
+}
+```
+
+# Model 3: Neuroimaging-only (Residualised)
+```{r m3_neuroimaging_resid}
+m3_neuro_resid <- lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m3_neuro_resid)
+```
+
+# Model 4: Age-only
+```{r m4_age_resid}
+# Age-only model: no residualisation needed (predictions not involved)
+m4_age_resid <- lmer(
+  true_g_z ~ age_deviation + age_mean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m4_age_resid)
+```
+
+# Model 5: Neuroimaging-and-Age (Residualised)
+```{r m5_neuro_age_resid}
+m5_neuro_age_resid <- lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             age_deviation + age_mean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m5_neuro_age_resid)
+```
+
+# Core Models Comparison (Residualised)
+```{r core_comparison_resid}
+comp_core_resid <- anova(m3_neuro_resid, m4_age_resid, m5_neuro_age_resid)
+print(comp_core_resid)
+```
+
+# SJPlot Tables: Core Models (Residualised)
+```{r sjplot_core_resid}
+tab_model(m3_neuro_resid, m4_age_resid, m5_neuro_age_resid,
+          dv.labels = c("Neuroimaging Only", "Age Only", "Neuroimaging-and-Age"),
+          pred.labels = c(
+            "(Intercept)"                  = "Intercept",
+            "stacked_pred_z_resid_dev"     = "ĝ<sub>deviation</sub>",
+            "stacked_pred_z_resid_mean"    = "ĝ<sub>mean</sub>",
+            "age_deviation"                = "age<sub>deviation</sub>",
+            "age_mean"                     = "age<sub>mean</sub>"
+          ),
+          show.aic = TRUE, show.dev = TRUE,
+          title = "Model Comparison: Neuroimaging and Age (Residualised)",
+          file = "core_models_resid")
+```
+
+# SJPlot Tables: ADHD Models (Residualised)
+```{r sjplot_adhd_resid}
+tab_model(m1_adhd_add_resid, m2_adhd_int_resid,
+          dv.labels = c("ADHD Additive", "ADHD Interactive"),
+          pred.labels = c(
+            "(Intercept)"                                 = "(Intercept)",
+            "stacked_pred_z_resid_dev"                    = "ĝ<sub>deviation</sub>",
+            "stacked_pred_z_resid_mean"                   = "ĝ<sub>mean</sub>",
+            "ADHDdiagnosisADHD"                           = "ADHD Diagnosis",
+            "stacked_pred_z_resid_dev:ADHDdiagnosisADHD" = "ĝ<sub>deviation</sub> × ADHD",
+            "stacked_pred_z_resid_mean:ADHDdiagnosisADHD" = "ĝ<sub>mean</sub> × ADHD"
+          ),
+          show.aic = TRUE, show.dev = TRUE,
+          title = "ADHD Diagnosis Comparison (Residualised)",
+          file = "adhd_diagnosis_resid")
+```
+
+# Model 6: Hyperactivity (Residualised)
+```{r m6_hyperactivity_resid}
+m6_hyper_resid <- lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             HyperactivityDeviation + HyperactivityMean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m6_hyper_resid)
+```
+
+# Hyperactivity Only (Residualised)
+```{r m6p5_hyperactivity_only_resid}
+m6p5_hyper_resid <- lmer(
+  true_g_z ~ HyperactivityDeviation + HyperactivityMean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m6p5_hyper_resid)
+```
+
+# Model 7: Inattention (Residualised)
+```{r m7_inattention_resid}
+m7_inatt_resid <- lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             InattentionDeviation + InattentionMean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m7_inatt_resid)
+```
+
+# Inattention Only (Residualised)
+```{r m7p5_inattention_only_resid}
+m7p5_inatt_resid <- lmer(
+  true_g_z ~ InattentionDeviation + InattentionMean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+summary(m7p5_inatt_resid)
+```
+
+# SJPlot Tables: Symptom Models (Residualised)
+```{r sjplot_symptoms_resid}
+tab_model(m6p5_hyper_resid, m6_hyper_resid,
+          dv.labels = c("Hyperactivity Only", "Neuroimaging-and-Hyperactivity"),
+          pred.labels = c(
+            "(Intercept)"                  = "Intercept",
+            "stacked_pred_z_resid_dev"     = "ĝ<sub>deviation</sub>",
+            "stacked_pred_z_resid_mean"    = "ĝ<sub>mean</sub>",
+            "HyperactivityMean"            = "Hyperactivity<sub>mean</sub>",
+            "HyperactivityDeviation"       = "Hyperactivity<sub>deviation</sub>"
+          ),
+          show.aic = TRUE, show.dev = TRUE,
+          title = "Hyperactivity (Residualised)",
+          file = "hyperactivity_resid")
+
+tab_model(m7p5_inatt_resid, m7_inatt_resid,
+          dv.labels = c("Inattention Only", "Neuroimaging-and-Inattention"),
+          pred.labels = c(
+            "(Intercept)"                  = "Intercept",
+            "stacked_pred_z_resid_dev"     = "ĝ<sub>deviation</sub>",
+            "stacked_pred_z_resid_mean"    = "ĝ<sub>mean</sub>",
+            "InattentionMean"              = "Inattention<sub>mean</sub>",
+            "InattentionDeviation"         = "Inattention<sub>deviation</sub>"
+          ),
+          show.aic = TRUE, show.dev = TRUE,
+          title = "Inattention (Residualised)",
+          file = "inattention_resid")
+```
+
+# R2 Decomposition: Model 3 (Residualised)
+```{r m3_r2_resid}
+r2_m3_resid <- r2mlm::r2mlm(m3_neuro_resid)
+print("Model 3 R-squared (residualised):")
+print(r2_m3_resid)
+```
+
+# Export R2 Decomposition: Model 3 (Residualised)
+```{r export_m3_r2_resid}
+decomp_matrix_resid <- r2_m3_resid$Decompositions
+
+decomp_df_resid <- data.frame(
+  component = rownames(decomp_matrix_resid),
+  total     = decomp_matrix_resid[, "total"],
+  within    = decomp_matrix_resid[, "within"],
+  between   = decomp_matrix_resid[, "between"],
+  stringsAsFactors = FALSE
+)
+
+write.csv(decomp_df_resid, "m3_r2mlm_decomposition_resid.csv", row.names = FALSE)
+cat("Exported to m3_r2mlm_decomposition_resid.csv\n")
+```
+
+# Commonality Analysis: Model 5 (Residualised)
+```{r m5_commonality_resid}
+m5_lme4_resid <- lme4::lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             age_deviation + age_mean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+
+m5_commonality_results_resid <- glmm.hp::glmm.hp(m5_lme4_resid, type = "adjR2",
+                                                   commonality = TRUE)
+print("Model 5 Commonality (residualised):")
+print(m5_commonality_results_resid)
+```
+
+# Adjust Commonality: Model 5 (Residualised)
+```{r m5_adjust_commonality_resid}
+m5_commonality_raw_resid <- m5_commonality_results_resid$commonality.analysis
+
+is_total <- grepl("total|Total|TOTAL", rownames(m5_commonality_raw_resid), ignore.case = TRUE)
+m5_components_resid <- m5_commonality_raw_resid[!is_total, , drop = FALSE]
+
+m5_pos_resid  <- ifelse(m5_components_resid[, 1] < 0, 0, m5_components_resid[, 1])
+names(m5_pos_resid) <- rownames(m5_components_resid)
+m5_sum_resid  <- sum(m5_pos_resid)
+m5_pct_resid  <- (m5_pos_resid / m5_sum_resid) * 100
+
+m5_commonality_adjusted_resid <- data.frame(
+  Component          = rownames(m5_components_resid),
+  Original_Fraction  = m5_components_resid[, 1],
+  Original_Percent   = m5_components_resid[, 2],
+  Adjusted_Fraction  = m5_pos_resid,
+  Adjusted_Percent   = m5_pct_resid,
+  stringsAsFactors   = FALSE
+)
+
+m5_commonality_adjusted_resid <- rbind(
+  m5_commonality_adjusted_resid,
+  data.frame(Component = "Total",
+             Original_Fraction = sum(m5_components_resid[, 1]),
+             Original_Percent  = 100.00,
+             Adjusted_Fraction = m5_sum_resid,
+             Adjusted_Percent  = 100.00,
+             stringsAsFactors  = FALSE)
+)
+
+print("Model 5 Adjusted Commonality (residualised):")
+print(m5_commonality_adjusted_resid)
+```
+
+# Commonality Analysis: Model 6 Hyperactivity (Residualised)
+```{r m6_commonality_resid}
+m6_lme4_resid <- lme4::lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             HyperactivityDeviation + HyperactivityMean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+
+m6_commonality_results_resid <- glmm.hp::glmm.hp(m6_lme4_resid, type = "adjR2",
+                                                   commonality = TRUE)
+print("Model 6 Commonality (residualised):")
+print(m6_commonality_results_resid)
+```
+
+# Adjust Commonality: Model 6 (Residualised)
+```{r m6_adjust_commonality_resid}
+m6_commonality_raw_resid <- m6_commonality_results_resid$commonality.analysis
+
+is_total <- grepl("total|Total|TOTAL", rownames(m6_commonality_raw_resid), ignore.case = TRUE)
+m6_components_resid <- m6_commonality_raw_resid[!is_total, , drop = FALSE]
+
+m6_pos_resid  <- ifelse(m6_components_resid[, 1] < 0, 0, m6_components_resid[, 1])
+names(m6_pos_resid) <- rownames(m6_components_resid)
+m6_sum_resid  <- sum(m6_pos_resid)
+m6_pct_resid  <- (m6_pos_resid / m6_sum_resid) * 100
+
+m6_commonality_adjusted_resid <- data.frame(
+  Component          = rownames(m6_components_resid),
+  Original_Fraction  = m6_components_resid[, 1],
+  Original_Percent   = m6_components_resid[, 2],
+  Adjusted_Fraction  = m6_pos_resid,
+  Adjusted_Percent   = m6_pct_resid,
+  stringsAsFactors   = FALSE
+)
+
+m6_commonality_adjusted_resid <- rbind(
+  m6_commonality_adjusted_resid,
+  data.frame(Component = "Total",
+             Original_Fraction = sum(m6_components_resid[, 1]),
+             Original_Percent  = 100.00,
+             Adjusted_Fraction = m6_sum_resid,
+             Adjusted_Percent  = 100.00,
+             stringsAsFactors  = FALSE)
+)
+
+print("Model 6 Adjusted Commonality (residualised):")
+print(m6_commonality_adjusted_resid)
+```
+
+
+# Commonality Analysis: Model 7 Inattention (Residualised)
+```{r m7_commonality_resid}
+m7_lme4_resid <- lme4::lmer(
+  true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+             InattentionDeviation + InattentionMean + (1 | participant_id),
+  data = analysis_data_resid_lme, REML = FALSE)
+
+m7_commonality_results_resid <- glmm.hp::glmm.hp(m7_lme4_resid, type = "adjR2",
+                                                   commonality = TRUE)
+print("Model 7 Commonality (residualised):")
+print(m7_commonality_results_resid)
+```
+
+# Adjust Commonality: Model 7 (Residualised)
+```{r m7_adjust_commonality_resid}
+m7_commonality_raw_resid <- m7_commonality_results_resid$commonality.analysis
+
+is_total <- grepl("total|Total|TOTAL", rownames(m7_commonality_raw_resid), ignore.case = TRUE)
+m7_components_resid <- m7_commonality_raw_resid[!is_total, , drop = FALSE]
+
+m7_pos_resid  <- ifelse(m7_components_resid[, 1] < 0, 0, m7_components_resid[, 1])
+names(m7_pos_resid) <- rownames(m7_components_resid)
+m7_sum_resid  <- sum(m7_pos_resid)
+m7_pct_resid  <- (m7_pos_resid / m7_sum_resid) * 100
+
+m7_commonality_adjusted_resid <- data.frame(
+  Component          = rownames(m7_components_resid),
+  Original_Fraction  = m7_components_resid[, 1],
+  Original_Percent   = m7_components_resid[, 2],
+  Adjusted_Fraction  = m7_pos_resid,
+  Adjusted_Percent   = m7_pct_resid,
+  stringsAsFactors   = FALSE
+)
+
+m7_commonality_adjusted_resid <- rbind(
+  m7_commonality_adjusted_resid,
+  data.frame(Component = "Total",
+             Original_Fraction = sum(m7_components_resid[, 1]),
+             Original_Percent  = 100.00,
+             Adjusted_Fraction = m7_sum_resid,
+             Adjusted_Percent  = 100.00,
+             stringsAsFactors  = FALSE)
+)
+
+print("Model 7 Adjusted Commonality (residualised):")
+print(m7_commonality_adjusted_resid)
+```
+
+# R2 Decomposition: Model 6 Hyperactivity (Residualised)
+```{r m6_r2_resid}
+r2_m6_resid <- r2mlm::r2mlm(m6_lme4_resid)
+print("Model 6 R-squared (residualised):")
+print(r2_m6_resid)
+```
+
+# R2 Decomposition: Model 7 Inattention (Residualised)
+```{r m7_r2_resid}
+r2_m7_resid <- r2mlm::r2mlm(m7_lme4_resid)
+print("Model 7 R-squared (residualised):")
+print(r2_m7_resid)
+```
+
+# Export Commonality and Decomposition
+```{r export_resid}
+write.csv(decomp_df_resid,
+          "m3_r2mlm_decomposition_resid.csv", row.names = FALSE)
+
+write.csv(m5_commonality_adjusted_resid,
+          "m5_neuro_age_commonality_adjusted_resid.csv", row.names = FALSE)
+
+write.csv(m6_commonality_adjusted_resid,
+          "m6_hyperactivity_commonality_adjusted_resid.csv", row.names = FALSE)
+
+write.csv(m7_commonality_adjusted_resid,
+          "m7_inattention_commonality_adjusted_resid.csv", row.names = FALSE)
+
+cat("All residualised outputs exported.\n")
+```
+
+# Residualised Analysis Wrapper Function
+```{r residualised_analysis_function}
+# Wrapper: residualises stacked_pred_z from specified confounds, runs the full
+# LME pipeline (m3, m5, m6, m7), and returns key comparison metrics.
+# Uses the same logic as the main residualisation and analysis chunks above.
+# get_adj_frac defined internally for self-containment.
+
+run_residualised_analysis <- function(data_full, confound_vars, label) {
+
+  # -- Internal helper: extract adjusted fraction by pattern match --
+  .get_adj_frac <- function(df, pattern) {
+    rows <- df[grepl(pattern, df$Component, ignore.case = FALSE, fixed = FALSE), ]
+    rows <- rows[rows$Component != "Total", ]
+    sum(rows$Adjusted_Fraction, na.rm = TRUE)
+  }
+
+  # -- Filter to complete cases for specified confounds --
+  resid_data <- data_full
+  for (v in confound_vars) {
+    resid_data <- resid_data %>% filter(!is.na(.data[[v]]))
+  }
+
+  # -- OLS residualisation of stacked predictions --
+  f_resid    <- as.formula(paste("stacked_pred_z ~", paste(confound_vars, collapse = " + ")))
+  m_resid    <- lm(f_resid, data = resid_data)
+  resid_data <- resid_data %>%
+    mutate(stacked_pred_z_resid = as.double(scale(residuals(m_resid))))
+
+  # -- Recompute within/between decomposition on residualised predictions --
+  resid_data <- resid_data %>%
+    group_by(participant_id) %>%
+    mutate(
+      stacked_pred_z_resid_mean = mean(stacked_pred_z_resid, na.rm = TRUE),
+      count_timepoints_resid    = n()
+    ) %>%
+    ungroup() %>%
+    mutate(stacked_pred_z_resid_dev = stacked_pred_z_resid - stacked_pred_z_resid_mean)
+
+  # -- Overall r on full dataset (pre-2+ filter, apples-to-apples with r=0.459) --
+  r_overall <- cor(resid_data$stacked_pred_z_resid, resid_data$true_g_z,
+                   use = "complete.obs")
+
+  # -- Longitudinal subset for LME analyses --
+  lme_data <- resid_data %>% filter(count_timepoints_resid >= 2)
+
+  # -- Interindividual and intraindividual correlations --
+  pl      <- lme_data %>% distinct(participant_id, .keep_all = TRUE)
+  r_means <- cor(pl$stacked_pred_z_resid_mean, pl$true_g_z_mean, use = "complete.obs")
+  r_dev   <- cor(lme_data$stacked_pred_z_resid_dev, lme_data$true_g_z_dev,
+                 use = "complete.obs")
+
+  # -- Model 3: neuroimaging only --
+  m3     <- lmer(true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+                   (1 | participant_id),
+                 data = lme_data, REML = FALSE)
+  r2_m3  <- r2mlm::r2mlm(m3)
+  r2_intra <- r2_m3$R2s["f1", "within"]  * 100
+  r2_inter <- r2_m3$R2s["f2", "between"] * 100
+
+  # -- Commonality helper: adjust, zero negatives, return data frame --
+  .run_commonality <- function(model) {
+    comm_res <- glmm.hp::glmm.hp(model, type = "adjR2", commonality = TRUE)
+    raw      <- comm_res$commonality.analysis
+    is_tot   <- grepl("total|Total|TOTAL", rownames(raw), ignore.case = TRUE)
+    comp     <- raw[!is_tot, , drop = FALSE]
+    pos      <- ifelse(comp[, 1] < 0, 0, comp[, 1])
+    names(pos) <- rownames(comp)
+    data.frame(Component = rownames(comp), Adjusted_Fraction = pos,
+               stringsAsFactors = FALSE)
+  }
+
+  # -- Model 5: neuroimaging + age (age capture percentages) --
+  m5    <- lme4::lmer(true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+                        age_deviation + age_mean + (1 | participant_id),
+                      data = lme_data, REML = FALSE)
+  m5_df <- .run_commonality(m5)
+
+  shared_dev_age  <- .get_adj_frac(m5_df, "resid_dev, and age_deviation")
+  unique_age_dev  <- .get_adj_frac(m5_df, "Unique to age_deviation")
+  age_intra       <- shared_dev_age  / (shared_dev_age  + unique_age_dev)  * 100
+
+  shared_mean_age <- .get_adj_frac(m5_df, "resid_mean, and age_mean")
+  unique_age_mean <- .get_adj_frac(m5_df, "Unique to age_mean")
+  age_inter       <- shared_mean_age / (shared_mean_age + unique_age_mean) * 100
+
+  # -- Model 6: hyperactivity commonality --
+  m6    <- lme4::lmer(true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+                        HyperactivityDeviation + HyperactivityMean + (1 | participant_id),
+                      data = lme_data, REML = FALSE)
+  m6_df <- .run_commonality(m6)
+
+  neuro_hyp_mean <- .get_adj_frac(m6_df, "HyperactivityMean") -
+                    .get_adj_frac(m6_df, "Unique to HyperactivityMean")
+  total_hyp_mean <- .get_adj_frac(m6_df, "HyperactivityMean")
+  neuro_hyp_dev  <- .get_adj_frac(m6_df, "HyperactivityDeviation") -
+                    .get_adj_frac(m6_df, "Unique to HyperactivityDeviation")
+  total_hyp_dev  <- .get_adj_frac(m6_df, "HyperactivityDeviation")
+
+  hyp_inter <- neuro_hyp_mean / total_hyp_mean * 100
+  hyp_intra <- if (total_hyp_dev == 0) 100 else neuro_hyp_dev / total_hyp_dev * 100
+  hyp_total <- (neuro_hyp_mean + neuro_hyp_dev) / (total_hyp_mean + total_hyp_dev) * 100
+
+  # -- Model 7: inattention commonality --
+  m7    <- lme4::lmer(true_g_z ~ stacked_pred_z_resid_dev + stacked_pred_z_resid_mean +
+                        InattentionDeviation + InattentionMean + (1 | participant_id),
+                      data = lme_data, REML = FALSE)
+  m7_df <- .run_commonality(m7)
+
+  neuro_inatt_mean <- .get_adj_frac(m7_df, "InattentionMean") -
+                      .get_adj_frac(m7_df, "Unique to InattentionMean")
+  total_inatt_mean <- .get_adj_frac(m7_df, "InattentionMean")
+  inatt_inter      <- neuro_inatt_mean / total_inatt_mean * 100
+
+  cat(sprintf("\n==== %s ====\n", label))
+  cat(sprintf("N (complete confound cases): %d  |  N (LME subset): %d\n",
+              nrow(resid_data), nrow(lme_data)))
+  cat(sprintf("Overall r:    %.3f\n", r_overall))
+  cat(sprintf("r means:      %.3f   r dev:   %.3f\n", r_means, r_dev))
+  cat(sprintf("Intra R2:     %.2f%%  Inter R2: %.2f%%\n", r2_intra, r2_inter))
+  cat(sprintf("Age intra:    %.1f%%  Age inter: %.1f%%\n", age_intra, age_inter))
+  cat(sprintf("Hyp inter:    %.1f%%  Hyp intra: %.1f%%  Hyp total: %.1f%%\n",
+              hyp_inter, hyp_intra, hyp_total))
+  cat(sprintf("Inatt inter:  %.1f%%\n", inatt_inter))
+
+  invisible(list(
+    label       = label,
+    r_overall   = r_overall,
+    r_means     = r_means,
+    r_dev       = r_dev,
+    r2_intra    = r2_intra,
+    r2_inter    = r2_inter,
+    age_intra   = age_intra,
+    age_inter   = age_inter,
+    hyp_inter   = hyp_inter,
+    hyp_intra   = hyp_intra,
+    hyp_total   = hyp_total,
+    inatt_inter = inatt_inter
+  ))
+}
+```
+
+# Separate Residualisations: Single Confounds
+```{r separate_residualisations}
+# Runs the full analysis pipeline separately for each confound in isolation,
+# plus the combined residualisation, for side-by-side comparison in the table.
+# NOTE: the combined residualisation here uses the wrapper function for
+# consistency; the detailed analysis above remains for full output/exports.
+
+cat("Running single-confound residualisations. This may take a few minutes.\n")
+
+res_med     <- run_residualised_analysis(
+  analysis_data_full, "current_stimmed_bin",             "Medication only")
+
+res_volumes <- run_residualised_analysis(
+  analysis_data_full, "perc_remaining_post_censoring",   "Volumes remaining only")
+
+res_edu     <- run_residualised_analysis(
+  analysis_data_full, "highest_edu",                     "Parental education only")
+
+res_euler   <- run_residualised_analysis(
+  analysis_data_full, "mean_euler",                      "Euler number only")
+
+res_combined <- run_residualised_analysis(
+  analysis_data_full,
+  c("current_stimmed_bin", "perc_remaining_post_censoring", "highest_edu", "mean_euler"),
+  "Combined (all four)")
+
+cat("\nAll separate residualisations complete.\n")
+```
+
+# Summary Comparison Table
+```{r summary_comparison_table}
+# ── Correlations (residualised) ──────────────────────────────────────────────
+# r_resid, r_resid_means, r_resid_dev computed in residualised_correlations chunk
+
+# ── R2 decomposition ─────────────────────────────────────────────────────────
+r2_intra_resid <- r2_m3_resid$R2s["f1", "within"]   * 100
+r2_inter_resid <- r2_m3_resid$R2s["f2", "between"]  * 100
+
+# ── Helper: extract Adjusted_Fraction by partial component name match ────────
+get_adj_frac <- function(df, pattern) {
+  rows <- df[grepl(pattern, df$Component, ignore.case = FALSE, fixed = FALSE), ]
+  rows <- rows[rows$Component != "Total", ]
+  sum(rows$Adjusted_Fraction, na.rm = TRUE)
+}
+
+# ── Age capture percentages (from m5 commonality) ────────────────────────────
+shared_dev_age_dev    <- get_adj_frac(m5_commonality_adjusted_resid,
+                                      "resid_dev, and age_deviation")
+unique_age_dev        <- get_adj_frac(m5_commonality_adjusted_resid,
+                                      "Unique to age_deviation")
+age_intra_resid       <- shared_dev_age_dev / (shared_dev_age_dev + unique_age_dev) * 100
+
+shared_mean_age_mean  <- get_adj_frac(m5_commonality_adjusted_resid,
+                                      "resid_mean, and age_mean")
+unique_age_mean       <- get_adj_frac(m5_commonality_adjusted_resid,
+                                      "Unique to age_mean")
+age_inter_resid       <- shared_mean_age_mean / (shared_mean_age_mean + unique_age_mean) * 100
+
+# ── Hyperactivity capture percentages (from m6 commonality) ──────────────────
+# All terms involving neuroimaging AND HypMean (interindividual)
+neuro_hyp_mean_resid  <- get_adj_frac(m6_commonality_adjusted_resid, "HyperactivityMean") -
+                         get_adj_frac(m6_commonality_adjusted_resid, "Unique to HyperactivityMean")
+total_hyp_mean_resid  <- get_adj_frac(m6_commonality_adjusted_resid, "HyperactivityMean")
+hyp_inter_resid       <- neuro_hyp_mean_resid / total_hyp_mean_resid * 100
+
+# All terms involving neuroimaging AND HypDev (intraindividual)
+neuro_hyp_dev_resid   <- get_adj_frac(m6_commonality_adjusted_resid, "HyperactivityDeviation") -
+                         get_adj_frac(m6_commonality_adjusted_resid, "Unique to HyperactivityDeviation")
+total_hyp_dev_resid   <- get_adj_frac(m6_commonality_adjusted_resid, "HyperactivityDeviation")
+hyp_intra_resid       <- if (total_hyp_dev_resid == 0) 100 else
+                          neuro_hyp_dev_resid / total_hyp_dev_resid * 100
+
+# Total hyperactivity capture
+total_hyp_resid       <- total_hyp_mean_resid + total_hyp_dev_resid
+neuro_hyp_total_resid <- neuro_hyp_mean_resid + neuro_hyp_dev_resid
+hyp_total_resid       <- neuro_hyp_total_resid / total_hyp_resid * 100
+
+# ── Inattention capture percentages (from m7 commonality) ────────────────────
+neuro_inatt_mean_resid <- get_adj_frac(m7_commonality_adjusted_resid, "InattentionMean") -
+                          get_adj_frac(m7_commonality_adjusted_resid, "Unique to InattentionMean")
+total_inatt_mean_resid <- get_adj_frac(m7_commonality_adjusted_resid, "InattentionMean")
+inatt_inter_resid      <- neuro_inatt_mean_resid / total_inatt_mean_resid * 100
+
+# ── Original values (from primary analysis script) ───────────────────────────
+# r values from Figure 5 scatterplots and manuscript text
+orig <- list(
+  r_overall   = 0.459,
+  r_means     = 0.47,
+  r_dev       = 0.52,
+  r2_intra    = 18.82,
+  r2_inter    = 25.01,
+  age_intra   = 60.87,
+  age_inter   = 72.52,
+  hyp_inter   = 43.36,
+  hyp_intra   = 100.00,
+  hyp_total   = 58.79,
+  inatt_inter = 25.99
+)
+
+# ── Build table ───────────────────────────────────────────────────────────────
+comparison_table <- data.frame(
+  Metric = c(
+    "Overall r (predicted vs observed g)",
+    "r (interindividual: means)",
+    "r (intraindividual: deviations)",
+    "Intraindividual R2 (f1 within)",
+    "Interindividual R2 (f2 between)",
+    "Intraindividual age-related change captured (%)",
+    "Interindividual age-related change captured (%)",
+    "Hyperactivity-cognition link captured: interindividual (%)",
+    "Hyperactivity-cognition link captured: intraindividual (%)",
+    "Hyperactivity-cognition link captured: total (%)",
+    "Inattention-cognition link captured: interindividual (%)"
+  ),
+  Original = round(c(
+    orig$r_overall, orig$r_means, orig$r_dev,
+    orig$r2_intra, orig$r2_inter,
+    orig$age_intra, orig$age_inter,
+    orig$hyp_inter, orig$hyp_intra, orig$hyp_total,
+    orig$inatt_inter
+  ), 2),
+  Resid_medication = round(c(
+    res_med$r_overall, res_med$r_means, res_med$r_dev,
+    res_med$r2_intra, res_med$r2_inter,
+    res_med$age_intra, res_med$age_inter,
+    res_med$hyp_inter, res_med$hyp_intra, res_med$hyp_total,
+    res_med$inatt_inter
+  ), 2),
+  Resid_volumes = round(c(
+    res_volumes$r_overall, res_volumes$r_means, res_volumes$r_dev,
+    res_volumes$r2_intra, res_volumes$r2_inter,
+    res_volumes$age_intra, res_volumes$age_inter,
+    res_volumes$hyp_inter, res_volumes$hyp_intra, res_volumes$hyp_total,
+    res_volumes$inatt_inter
+  ), 2),
+  Resid_education = round(c(
+    res_edu$r_overall, res_edu$r_means, res_edu$r_dev,
+    res_edu$r2_intra, res_edu$r2_inter,
+    res_edu$age_intra, res_edu$age_inter,
+    res_edu$hyp_inter, res_edu$hyp_intra, res_edu$hyp_total,
+    res_edu$inatt_inter
+  ), 2),
+  Resid_euler = round(c(
+    res_euler$r_overall, res_euler$r_means, res_euler$r_dev,
+    res_euler$r2_intra, res_euler$r2_inter,
+    res_euler$age_intra, res_euler$age_inter,
+    res_euler$hyp_inter, res_euler$hyp_intra, res_euler$hyp_total,
+    res_euler$inatt_inter
+  ), 2),
+  Resid_combined = round(c(
+    res_combined$r_overall, res_combined$r_means, res_combined$r_dev,
+    res_combined$r2_intra, res_combined$r2_inter,
+    res_combined$age_intra, res_combined$age_inter,
+    res_combined$hyp_inter, res_combined$hyp_intra, res_combined$hyp_total,
+    res_combined$inatt_inter
+  ), 2),
+  stringsAsFactors = FALSE
+)
+
+print(comparison_table)
+write.csv(comparison_table, "sensitivity_residualised_comparison_table.csv", row.names = FALSE)
+cat("\nExported to sensitivity_residualised_comparison_table.csv\n")
+```
