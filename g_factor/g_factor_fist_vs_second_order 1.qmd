@@ -1,0 +1,205 @@
+---
+title: "g factor from first vs second order CFA"
+format:
+  html:
+    embed-resources: true
+  pdf: default
+---
+
+
+```{r}
+rm(list = ls())
+```
+
+```{r}
+library(tidyverse)
+library(lavaan)
+library(psych)
+library(GPArotation)
+library(esemComp)
+library(lavaanPlot)
+library(ggpubr)
+library(ggExtra)
+```
+
+### Read data from the data processed file.
+```{r}
+cog_data <- readr::read_csv("all_longitudinal_cognitive_data_processed.csv")
+```
+
+### Change the name of the cognitive variables to make it easier to plot on sempath.
+```{r}
+cog_data_renamed <- cog_data |>  rename(
+    SST = stopsig_stop_sdgort,
+    Dprime = cpth_dprime1,
+    nback = nback_n2backacc,
+    forward = wisc_digitspan_dsfscore,
+    backward = wisc_digitspan_dsbscore,
+    word = wiat_wordread_score
+  )
+```
+
+### Scale the cognitive variables and select only the scaled versions for the factor analysis.
+```{r}
+cognitive_vars <- c("SST","Dprime","nback","forward","backward","word")
+
+cog_data_scaled <- cog_data_renamed |>
+  mutate(across(all_of(cognitive_vars),
+                ~ as.numeric(scale(.x)),
+                .names = "{.col}_z")) |>
+                   select(ends_with("_z")) |> 
+  rename_with(~ sub("_z$", "", .x))
+
+cog_data_scaled 
+
+```
+
+## First model. The orginal one factor model where all tasks load on a single factor, g.
+```{r}
+first_order <- "g =~ SST + Dprime + nback + forward + backward + word"
+
+first_order_Fit <- lavaan::cfa(model = first_order, data = cog_data_scaled,std.lv = TRUE, missing = "fiml")
+
+```
+
+### Summarise the one factor model.
+```{r}
+summary(first_order_Fit, fit.measures = TRUE, standardized = TRUE)
+```
+
+### Plot the one factor model with semPlot.
+```{r}
+Plabels = c("SST","Dprime","nback","forward","backward","word",expression(paste(italic("g"))))
+semPlot::semPaths(object = first_order_Fit,
+  intercepts = FALSE, residuals = FALSE,
+  whatLabels = "std", what = "std",
+  layout = "tree",
+  node.width = 1.4,
+  label.cex = 1,        # node label size
+  edge.label.cex = 1.4,   # edge label size
+  nodeLabels = Plabels,
+  label.color = "black",  # label color (nodes & edges)
+  edge.color = "black",
+  sizeMan = 10, sizeLat = 10)
+```
+
+### clearner plot with lavaanPlot
+```{r}
+lavaanPlot(name = "first_order",
+           model = first_order_Fit,
+           coefs = TRUE,
+           stand = TRUE)
+
+```
+
+
+## Improve the model fit using an alternative model. Second order
+
+### start by running a parallel analysis to determine the number of factors to extract in the EFA.
+
+Parallel analysis suggests that the number of factors =  2  and the number of components =  1 
+```{r}
+cog_data_scaled %>%  select(all_of(cognitive_vars)) %>%
+  psych::fa.parallel(fm='ml')
+```
+
+2 factors were suggested by the parallel analysis, so we will run an EFA with 2 factors.
+```{r}
+cog_efa <- cog_data_scaled %>%  
+    select(all_of(cognitive_vars)) %>%
+    psych::fa(nfactors = 2, fm = 'ml', rotate = "oblimin")
+
+cog_efa
+```
+
+### plot EFA results. Wisc digit span forward and backward load on the second factor, while the rest of the tasks load on the first factor.
+
+```{r}
+psych::fa.diagram(cog_efa)
+```
+
+### Second CFA model. Inspired by the EFA, a second order model where the 6 tasks load on two first order factors, EF_lang and digit_span, which then load on a second order factor, g. 
+```{r}
+second_order <- "EF_lang =~ SST + Dprime + nback + word
+                 digit_span =~ forward + backward
+                 g =~ NA*EF_lang + digit_span 
+                 g~~ 1*g"
+
+second_order_Fit <- lavaan::cfa(model = second_order, data = cog_data_scaled,std.lv = TRUE, missing = "fiml")
+```
+
+### Summarise the second order factor model. Better fit
+```{r}
+summary(second_order_Fit, fit.measures = TRUE, standardized = TRUE)
+```
+
+### Plot the the second order factor model using semPlot.
+```{r}
+Plabels = c("SST","Dprime","nback","word","forward","backward","EF lang","digit span",expression(paste(italic("g"))))
+semPlot::semPaths(
+  object = second_order_Fit,
+  intercepts = FALSE, residuals = FALSE,
+  whatLabels = "std", what = "std",
+  layout = "tree",
+  node.width = 1.4,
+  label.cex = 1,        # node label size
+  edge.label.cex = 1.4,   # edge label size
+  nodeLabels = Plabels,
+  label.color = "black",  # label color (nodes & edges)
+  edge.color = "black",
+  sizeMan = 10, sizeLat = 10)
+```
+
+### plot the second order factor model with lavaanPlot
+
+```{r}
+lavaanPlot(name = "second_order_CFA",
+           model = second_order_Fit,
+           stand = TRUE,
+           coefs = TRUE)
+```
+
+## correlational between g factor scores from the second order CFA and the first order CFA.
+
+### extract g factor scores from the first order CFA
+```{r}
+
+first_order_scores <- lavaan::lavPredict(first_order_Fit)
+second_order_scores <- lavaan::lavPredict(second_order_Fit)
+
+cog_data_g<- cog_data %>% 
+  mutate(first_order_g = as.numeric(first_order_scores[, "g"]),
+         second_order_g = as.numeric(second_order_scores[, "g"]))
+
+```
+
+### correlation is .996
+
+```{r}
+cog_data_g %>% select(first_order_g, second_order_g) %>%
+  cor()
+```
+
+### Plot the relationship between the g factor scores from the first order and second order CFA. The correlation is very high, suggesting that the two models are capturing very similar constructs, despite the second order model having a better fit to the data.
+
+```{r}
+p <- ggscatter(cog_data_g , 
+x = "first_order_g", 
+y = "second_order_g",
+alpha = 0.2,
+xlab = "First-order g",
+ylab = "Second-order g",
+add = "reg.line",# Add regression line
+conf.int = TRUE, # Add confidence interval
+add.params = list(color = "blue",
+fill = "lightgray"))+
+stat_cor(method = "pearson", 
+label.x = -2.7, 
+label.y = 1,
+cor.coef.name = "r",
+digits = 3,
+size = 7)+  # Add correlation coefficient
+theme(text = element_text(size = 20))
+
+ggMarginal(p, type = "density")
+```
